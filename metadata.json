@@ -1,0 +1,6 @@
+{
+  "name": "SimLab Competency Hub",
+  "description": "Syllabus-aligned virtual laboratory featuring PCR amplification & agarose gel electrophoresis, optics bench u-v method, interactive apparatus, auto-graded tasks, AI viva assessment, and practical competency tracking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
