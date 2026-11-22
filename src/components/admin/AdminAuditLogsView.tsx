@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { History, Shield, RefreshCw, Filter, AlertCircle, CheckCircle2 } from 'lucide-react';
+import { History, RefreshCw, AlertCircle } from 'lucide-react';
 
 interface AdminAuditLogsViewProps {
   token: string | null;
@@ -8,21 +8,29 @@ interface AdminAuditLogsViewProps {
 export const AdminAuditLogsView: React.FC<AdminAuditLogsViewProps> = ({ token }) => {
   const [events, setEvents] = useState<any[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
+  const [error, setError] = useState<string>('');
   const [eventTypeFilter, setEventTypeFilter] = useState<string>('ALL');
 
   const fetchAuditLogs = async () => {
     if (!token) return;
     setLoading(true);
+    setError('');
     try {
-      const res = await fetch('/api/admin/audit-logs?limit=50', {
+      const res = await fetch('/api/admin/audit-logs?limit=100', {
         headers: { Authorization: `Bearer ${token}` },
       });
-      const data = await res.json();
-      if (data.success && data.events) {
-        setEvents(data.events);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to load audit logs.');
       }
-    } catch {
-      // Ignore network errors
+      const list = Array.isArray(data.events)
+        ? data.events
+        : Array.isArray(data.logs)
+        ? data.logs
+        : [];
+      setEvents(list);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to load audit logs.');
     } finally {
       setLoading(false);
     }
@@ -46,13 +54,15 @@ export const AdminAuditLogsView: React.FC<AdminAuditLogsViewProps> = ({ token })
               <History className="h-3 w-3" />
               Security Audit Trail
             </span>
-            <span className="text-xs text-stone-500 dark:text-stone-400">PostgreSQL auth_events Table</span>
+            <span className="text-xs text-stone-500 dark:text-stone-400">
+              Audit History
+            </span>
           </div>
           <h2 className="mt-1 text-xl font-bold text-stone-900 dark:text-stone-100">
             Authentication & Authorization Events
           </h2>
           <p className="text-xs text-stone-600 dark:text-stone-300">
-            Immutable system audit logs detailing registrations, logins, token rotations, password resets, and session revocations.
+            Immutable system audit logs detailing registrations, logins, faculty evaluations, status updates, and session revocations.
           </p>
         </div>
 
@@ -66,14 +76,31 @@ export const AdminAuditLogsView: React.FC<AdminAuditLogsViewProps> = ({ token })
         </button>
       </div>
 
+      {error && (
+        <div className="flex items-center gap-2 rounded-xl border border-rose-200 dark:border-rose-900/60 bg-rose-50 dark:bg-rose-950/40 px-4 py-3 text-xs text-rose-700 dark:text-rose-300">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          <span>{error}</span>
+        </div>
+      )}
+
       {/* Event Filters */}
       <div className="flex flex-wrap gap-1.5">
-        {['ALL', 'LOGIN_SUCCESS', 'LOGIN_FAILURE', 'TOKEN_REFRESH', 'LOGOUT', 'REGISTER', 'PASSWORD_CHANGE'].map((f) => (
+        {[
+          'ALL',
+          'LOGIN_SUCCESS',
+          'FIREBASE_LOGIN_SUCCESS',
+          'LOGIN_FAILURE',
+          'TOKEN_REFRESH',
+          'LOGOUT',
+          'REGISTER',
+          'FACULTY_EVALUATION',
+          'ACCOUNT_STATUS_UPDATED',
+        ].map((f) => (
           <button
             key={f}
             type="button"
             onClick={() => setEventTypeFilter(f)}
-            className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+            className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold transition-colors cursor-pointer ${
               eventTypeFilter === f
                 ? 'bg-stone-900 dark:bg-amber-500 text-white dark:text-stone-950 shadow-xs'
                 : 'bg-white dark:bg-stone-900 border border-stone-200 dark:border-stone-800 text-stone-700 dark:text-stone-300'
@@ -86,50 +113,60 @@ export const AdminAuditLogsView: React.FC<AdminAuditLogsViewProps> = ({ token })
 
       {/* Audit Logs Table */}
       <div className="rounded-xl border border-stone-200 dark:border-stone-800 bg-white dark:bg-stone-900 p-4 shadow-xs overflow-x-auto">
-        <table className="w-full text-left text-xs">
-          <thead className="border-b border-stone-100 dark:border-stone-800 text-stone-500 dark:text-stone-400 font-medium">
-            <tr>
-              <th className="pb-2.5">Event</th>
-              <th className="pb-2.5">User ID</th>
-              <th className="pb-2.5">IP Address</th>
-              <th className="pb-2.5">User Agent</th>
-              <th className="pb-2.5">Metadata</th>
-              <th className="pb-2.5 text-right">Timestamp</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-stone-100 dark:divide-stone-800 font-mono text-[11px]">
-            {filteredEvents.map((evt) => (
-              <tr key={evt.id} className="text-stone-800 dark:text-stone-200">
-                <td className="py-2.5">
-                  <span
-                    className={`inline-block rounded px-2 py-0.5 font-bold ${
-                      evt.event_type.includes('SUCCESS')
-                        ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400'
-                        : evt.event_type.includes('FAILURE') || evt.event_type.includes('DETECTED')
-                        ? 'bg-rose-50 dark:bg-rose-950/60 text-rose-700 dark:text-rose-400'
-                        : 'bg-stone-100 dark:bg-stone-800 text-stone-700 dark:text-stone-300'
-                    }`}
-                  >
-                    {evt.event_type}
-                  </span>
-                </td>
-                <td className="py-2.5 text-stone-600 dark:text-stone-300">
-                  {evt.user_id ? evt.user_id.slice(0, 10) + '...' : 'ANONYMOUS'}
-                </td>
-                <td className="py-2.5">{evt.ip_address || '127.0.0.1'}</td>
-                <td className="py-2.5 text-stone-500 truncate max-w-[120px]">
-                  {evt.user_agent || 'Unknown'}
-                </td>
-                <td className="py-2.5 text-stone-500">
-                  {typeof evt.metadata === 'object' ? JSON.stringify(evt.metadata) : evt.metadata || '—'}
-                </td>
-                <td className="py-2.5 text-right text-stone-500">
-                  {new Date(evt.created_at).toLocaleString()}
-                </td>
+        {loading ? (
+          <p className="py-6 text-center text-xs text-stone-500">Loading audit events...</p>
+        ) : filteredEvents.length === 0 ? (
+          <p className="py-6 text-center text-xs text-stone-500">
+            No audit events match the selected filter.
+          </p>
+        ) : (
+          <table className="w-full text-left text-xs">
+            <thead className="border-b border-stone-100 dark:border-stone-800 text-stone-500 dark:text-stone-400 font-medium">
+              <tr>
+                <th className="pb-2.5">Event</th>
+                <th className="pb-2.5">User ID</th>
+                <th className="pb-2.5">IP Address</th>
+                <th className="pb-2.5">User Agent</th>
+                <th className="pb-2.5">Metadata</th>
+                <th className="pb-2.5 text-right">Timestamp</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody className="divide-y divide-stone-100 dark:divide-stone-800 font-mono text-[11px]">
+              {filteredEvents.map((evt) => (
+                <tr key={evt.id} className="text-stone-800 dark:text-stone-200">
+                  <td className="py-2.5">
+                    <span
+                      className={`inline-block rounded px-2 py-0.5 font-bold ${
+                        evt.event_type.includes('SUCCESS') || evt.event_type === 'FACULTY_EVALUATION'
+                          ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400'
+                          : evt.event_type.includes('FAILURE') || evt.event_type.includes('DETECTED')
+                          ? 'bg-rose-50 dark:bg-rose-950/60 text-rose-700 dark:text-rose-400'
+                          : 'bg-stone-100 dark:bg-stone-800 text-stone-700 dark:text-stone-300'
+                      }`}
+                    >
+                      {evt.event_type}
+                    </span>
+                  </td>
+                  <td className="py-2.5 text-stone-600 dark:text-stone-300">
+                    {evt.user_id ? evt.user_id.slice(0, 14) : 'ANONYMOUS'}
+                  </td>
+                  <td className="py-2.5">{evt.ip_address || '127.0.0.1'}</td>
+                  <td className="py-2.5 text-stone-500 truncate max-w-[120px]">
+                    {evt.user_agent || 'Unknown'}
+                  </td>
+                  <td className="py-2.5 text-stone-500">
+                    {typeof evt.metadata === 'object'
+                      ? JSON.stringify(evt.metadata)
+                      : evt.metadata || '—'}
+                  </td>
+                  <td className="py-2.5 text-right text-stone-500">
+                    {new Date(evt.created_at).toLocaleString()}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </div>
     </div>
   );

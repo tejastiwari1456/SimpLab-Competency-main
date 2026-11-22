@@ -5,13 +5,12 @@ import {
   Building2,
   History,
   Activity,
-  AlertTriangle,
   CheckCircle2,
-  Lock,
-  Server,
   ArrowRight,
+  AlertCircle,
 } from 'lucide-react';
 import { CurrentUser } from '../../types';
+import { EXPERIMENTS } from '../../data/mockData';
 
 interface AdminDashboardViewProps {
   currentUser: CurrentUser;
@@ -24,33 +23,77 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
   onNavigate,
   token,
 }) => {
-  const [usersCount, setUsersCount] = useState<number>(3);
+  const [usersCount, setUsersCount] = useState<number>(0);
   const [auditLogsCount, setAuditLogsCount] = useState<number>(0);
+  const [institutionsCount, setInstitutionsCount] = useState<number>(0);
   const [recentEvents, setRecentEvents] = useState<any[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
+  const [loadError, setLoadError] = useState<string>('');
 
   useEffect(() => {
     if (!token) return;
+    let cancelled = false;
+    setLoading(true);
+    setLoadError('');
+
     Promise.all([
-      fetch('/api/admin/users', { headers: { Authorization: `Bearer ${token}` } })
-        .then((r) => r.json())
-        .catch(() => ({ users: [] })),
-      fetch('/api/admin/audit-logs?limit=5', { headers: { Authorization: `Bearer ${token}` } })
-        .then((r) => r.json())
-        .catch(() => ({ events: [] })),
+      fetch('/api/admin/users', { headers: { Authorization: `Bearer ${token}` } }).then(async (r) => {
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.error || 'Failed to load users.');
+        return d;
+      }),
+      fetch('/api/admin/audit-logs?limit=5', { headers: { Authorization: `Bearer ${token}` } }).then(
+        async (r) => {
+          const d = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(d.error || 'Failed to load audit logs.');
+          return d;
+        }
+      ),
+      fetch('/api/admin/institutions', { headers: { Authorization: `Bearer ${token}` } }).then(
+        async (r) => {
+          const d = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(d.error || 'Failed to load institutions.');
+          return d;
+        }
+      ),
     ])
-      .then(([usersData, auditData]) => {
-        if (usersData?.users) setUsersCount(usersData.users.length);
-        if (auditData?.events) {
-          setRecentEvents(auditData.events);
-          setAuditLogsCount(auditData.events.length);
+      .then(([usersData, auditData, instData]) => {
+        if (cancelled) return;
+        if (Array.isArray(usersData?.users)) setUsersCount(usersData.users.length);
+        const evts = Array.isArray(auditData?.events)
+          ? auditData.events
+          : Array.isArray(auditData?.logs)
+          ? auditData.logs
+          : [];
+        setRecentEvents(evts.slice(0, 5));
+        setAuditLogsCount(evts.length);
+        if (Array.isArray(instData?.institutions)) {
+          setInstitutionsCount(instData.institutions.length);
         }
       })
-      .finally(() => setLoading(false));
+      .catch((err) => {
+        if (!cancelled) {
+          setLoadError(err instanceof Error ? err.message : 'Unable to load admin overview.');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [token]);
 
   return (
     <div id="admin-dashboard-view" className="space-y-6">
+      {loadError && (
+        <div className="flex items-center gap-2 rounded-xl border border-rose-200 dark:border-rose-900/60 bg-rose-50 dark:bg-rose-950/40 px-4 py-3 text-xs text-rose-700 dark:text-rose-300">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          <span>{loadError}</span>
+        </div>
+      )}
+
       {/* Header Banner */}
       <div className="flex flex-col justify-between gap-4 rounded-2xl border border-stone-200 dark:border-stone-800 bg-white dark:bg-stone-900 p-6 shadow-xs sm:flex-row sm:items-center transition-colors">
         <div>
@@ -60,28 +103,28 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
               Administrative Security Control Plane
             </span>
             <span className="text-xs text-stone-500 dark:text-stone-400">
-              Super Admin Session
+              {currentUser.name}
             </span>
           </div>
           <h1 className="mt-2 text-2xl font-bold tracking-tight text-stone-900 dark:text-stone-100 sm:text-3xl">
             System Overview & Governance
           </h1>
           <p className="mt-1 text-xs text-stone-600 dark:text-stone-300 max-w-xl leading-relaxed">
-            Centralized platform security, institutional tenant controls, user status revocation, and real-time database audit inspection.
+            Centralized platform security, institutional tenant controls, user status revocation, and live audit inspection.
           </p>
         </div>
 
         <div className="flex sm:flex-col items-center justify-between sm:justify-center rounded-xl border border-rose-200 dark:border-rose-900/60 bg-rose-50/50 dark:bg-rose-950/30 p-4 text-center min-w-[160px]">
           <span className="text-xs font-semibold uppercase tracking-wider text-rose-800 dark:text-rose-300">
-            System Health
+            Access Policy
           </span>
           <div className="mt-1 flex items-baseline gap-1">
             <span className="text-2xl font-extrabold text-stone-900 dark:text-rose-400">
-              Optimal
+              Enforced
             </span>
           </div>
           <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-semibold mt-0.5 flex items-center gap-0.5">
-            <CheckCircle2 className="h-3 w-3" /> RBAC Enforced
+            <CheckCircle2 className="h-3 w-3" /> Role-Based Guard
           </span>
         </div>
       </div>
@@ -99,7 +142,7 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
             </div>
           </div>
           <div className="mt-2 text-2xl font-bold text-stone-900 dark:text-stone-100">
-            {usersCount}
+            {loading ? '—' : usersCount}
           </div>
           <p className="mt-1 text-[11px] text-stone-500 dark:text-stone-400 flex items-center gap-1">
             <span>Students, Teachers & Admins</span>
@@ -118,10 +161,10 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
             </div>
           </div>
           <div className="mt-2 text-2xl font-bold text-stone-900 dark:text-stone-100">
-            {auditLogsCount > 0 ? `${auditLogsCount}+` : 'Active'}
+            {loading ? '—' : auditLogsCount}
           </div>
           <p className="mt-1 text-[11px] text-stone-500 dark:text-stone-400 flex items-center gap-1">
-            <span>PostgreSQL Audit Trail</span>
+            <span>Recent Audit Records</span>
             <ArrowRight className="h-3 w-3 group-hover:translate-x-0.5 transition-transform" />
           </p>
         </div>
@@ -137,29 +180,29 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
             </div>
           </div>
           <div className="mt-2 text-2xl font-bold text-stone-900 dark:text-stone-100">
-            3 Campuses
+            {loading ? '—' : `${institutionsCount} ${institutionsCount === 1 ? 'Institution' : 'Institutions'}`}
           </div>
           <p className="mt-1 text-[11px] text-stone-500 dark:text-stone-400 flex items-center gap-1">
-            <span>Multi-tenant Isolation</span>
+            <span>Active Academic Tenants</span>
             <ArrowRight className="h-3 w-3 group-hover:translate-x-0.5 transition-transform" />
           </p>
         </div>
 
         <div
-          onClick={() => onNavigate('/admin/analytics')}
+          onClick={() => onNavigate('/admin/settings')}
           className="rounded-xl border border-stone-200 dark:border-stone-800 bg-white dark:bg-stone-900 p-5 shadow-xs hover:border-amber-400 dark:hover:border-amber-600 transition-all cursor-pointer group"
         >
           <div className="flex items-center justify-between">
-            <span className="text-xs font-semibold text-stone-500 dark:text-stone-400">Simulation Engine</span>
+            <span className="text-xs font-semibold text-stone-500 dark:text-stone-400">Lab Modules</span>
             <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-100 dark:bg-emerald-950/80 text-emerald-600 dark:text-emerald-400">
               <Activity className="h-4 w-4" />
             </div>
           </div>
           <div className="mt-2 text-2xl font-bold text-stone-900 dark:text-stone-100">
-            100% Uptime
+            {EXPERIMENTS.length} Active
           </div>
           <p className="mt-1 text-[11px] text-stone-500 dark:text-stone-400 flex items-center gap-1">
-            <span>5 Virtual Lab Apparatus</span>
+            <span>Registered Apparatus Catalog</span>
             <ArrowRight className="h-3 w-3 group-hover:translate-x-0.5 transition-transform" />
           </p>
         </div>
@@ -170,18 +213,22 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
         <div className="flex items-center justify-between border-b border-stone-100 dark:border-stone-800 pb-3">
           <h2 className="text-sm font-bold text-stone-900 dark:text-stone-100 flex items-center gap-2">
             <History className="h-4 w-4 text-rose-500" />
-            <span>Recent PostgreSQL Authentication & Authorization Events</span>
+            <span>Recent Authentication & Authorization Events</span>
           </h2>
           <button
             type="button"
             onClick={() => onNavigate('/admin/audit')}
-            className="text-xs font-semibold text-amber-600 dark:text-amber-400 hover:underline"
+            className="text-xs font-semibold text-amber-600 dark:text-amber-400 hover:underline cursor-pointer"
           >
             Full Audit Trail →
           </button>
         </div>
 
-        {recentEvents.length > 0 ? (
+        {loading ? (
+          <p className="text-xs text-stone-500 dark:text-stone-400 py-2">
+            Loading security audit events...
+          </p>
+        ) : recentEvents.length > 0 ? (
           <div className="divide-y divide-stone-100 dark:divide-stone-800">
             {recentEvents.map((evt, idx) => (
               <div key={evt.id || idx} className="py-2.5 flex items-center justify-between text-xs">

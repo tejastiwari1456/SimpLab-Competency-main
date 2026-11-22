@@ -12,6 +12,7 @@ import {
   BookOpen,
 } from 'lucide-react';
 import { Experiment } from '../../types';
+import { useAuth } from '../../context/AuthContext';
 
 interface Message {
   id: string;
@@ -23,13 +24,18 @@ interface Message {
 
 interface LabMentorChatProps {
   experiment: Experiment;
+  currentStepLabel?: string;
+  apparatusState?: Record<string, unknown>;
   isDark?: boolean;
 }
 
 export const LabMentorChat: React.FC<LabMentorChatProps> = ({
   experiment,
+  currentStepLabel,
+  apparatusState,
   isDark = false,
 }) => {
+  const { token } = useAuth();
   const [isOpen, setIsOpen] = useState<boolean>(false);
   const [isExpanded, setIsExpanded] = useState<boolean>(false);
   const [input, setInput] = useState<string>('');
@@ -43,7 +49,7 @@ export const LabMentorChat: React.FC<LabMentorChatProps> = ({
       id: `init-${experiment.id}`,
       role: 'assistant',
       content: `Hello! I am your **Lab Mentor** for **${experiment.title}** (${experiment.code}).\n\nI am monitoring your experimental setup, governing formulas (${experiment.keyFormulas.map((f) => f.label).join(', ')}), and task steps. If you get stuck on circuit wiring, meter zero-errors, titration color changes, stopping potential calibration, or graph analysis, ask me below!`,
-      source: 'Gemini 3.8 Flash',
+      source: 'AI Lab Mentor',
       timestamp: new Date(),
     };
     setMessages([initialGreeting]);
@@ -81,6 +87,22 @@ export const LabMentorChat: React.FC<LabMentorChatProps> = ({
         'How do I deduce Planck’s constant from the slope?',
       ];
     }
+    if (experiment.id === 'exp-convex-lens') {
+      return [
+        'Why is the projected image blurred on the screen?',
+        'What happens when u < f on the optical bench?',
+        'How do I derive f = (u·v)/(u+v) using Cartesian signs?',
+        'How do I interpret the 1/v vs 1/u linear plot?',
+      ];
+    }
+    if (experiment.id === 'exp-pcr-gel') {
+      return [
+        'Why is a No-Template Control (NTC) critical in PCR?',
+        'What happens if annealing temperature is set too low?',
+        'How do I size the amplicon against the 100 bp ladder?',
+        'Why does DNA migrate toward the red positive anode?',
+      ];
+    }
     return [
       'What are the governing equations for this experiment?',
       'How do I record accurate readings without parallax error?',
@@ -104,9 +126,14 @@ export const LabMentorChat: React.FC<LabMentorChatProps> = ({
     setLoading(true);
 
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
+      }
+
       const res = await fetch('/api/gemini/mentor-chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           experimentId: experiment.id,
           experimentTitle: experiment.title,
@@ -114,37 +141,35 @@ export const LabMentorChat: React.FC<LabMentorChatProps> = ({
           syllabusTag: experiment.syllabusTag,
           apparatusList: experiment.apparatusList,
           keyFormulas: experiment.keyFormulas,
+          currentStep: currentStepLabel || 'Interactive Apparatus & Validation',
+          apparatusState,
           messages: messages.map((m) => ({ role: m.role, content: m.content })),
           question: text,
         }),
       });
 
-      const data = await res.json();
-      const replyContent =
-        data.reply ||
-        'I am analyzing your apparatus readings. Double-check your current meter range and step guidelines.';
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.success || !data?.reply) {
+        throw new Error(data?.error || `Lab Mentor request failed (HTTP ${res.status}).`);
+      }
 
       const assistantMessage: Message = {
         id: `ast-${Date.now()}`,
         role: 'assistant',
-        content: replyContent,
-        source:
-          data.source === 'gemini-3.8-flash'
-            ? 'Gemini 3.8 Flash'
-            : data.source === 'gemini-3.1-flash-lite'
-            ? 'Gemini 3.1 Flash Lite'
-            : 'Socratic Lab Engine',
+        content: data.reply,
+        source: data.source || 'AI Lab Mentor',
         timestamp: new Date(),
       };
 
       setMessages((prev) => [...prev, assistantMessage]);
-    } catch (err) {
+    } catch (err: any) {
       const errorMsg: Message = {
         id: `ast-${Date.now()}`,
         role: 'assistant',
         content:
-          'I encountered a brief connection issue. In the meantime, verify that all series/parallel connections are secure and that instrument scales are calibrated properly.',
-        source: 'Socratic Lab Engine',
+          err?.message ||
+          'Lab Mentor could not process your question right now. Please try again in a moment.',
+        source: 'Service Notice',
         timestamp: new Date(),
       };
       setMessages((prev) => [...prev, errorMsg]);
@@ -165,7 +190,7 @@ export const LabMentorChat: React.FC<LabMentorChatProps> = ({
       id: `init-${Date.now()}`,
       role: 'assistant',
       content: `Conversation reset. How can I assist you with your **${experiment.title}** apparatus or calculations right now?`,
-      source: 'Gemini 3.8 Flash',
+      source: 'AI Lab Mentor',
       timestamp: new Date(),
     };
     setMessages([resetGreeting]);
@@ -180,7 +205,7 @@ export const LabMentorChat: React.FC<LabMentorChatProps> = ({
             type="button"
             onClick={() => setIsOpen(true)}
             id="lab-mentor-floating-btn"
-            className="group flex items-center gap-2.5 rounded-full bg-stone-900 dark:bg-amber-500 px-4 py-2.5 text-xs font-semibold text-white dark:text-stone-950 shadow-xl ring-2 ring-amber-400/50 hover:bg-stone-800 dark:hover:bg-amber-400 hover:scale-105 active:scale-95 transition-all duration-200"
+            className="group flex items-center gap-2.5 rounded-full bg-stone-900 dark:bg-amber-500 px-4 py-2.5 text-xs font-semibold text-white dark:text-stone-950 shadow-xl ring-2 ring-amber-400/50 hover:bg-stone-800 dark:hover:bg-amber-400 hover:scale-105 active:scale-95 transition-all duration-200 cursor-pointer"
             title="Open Context-Aware AI Lab Mentor"
           >
             <span className="relative flex h-2 w-2">
@@ -217,7 +242,7 @@ export const LabMentorChat: React.FC<LabMentorChatProps> = ({
                   <h3 className="text-xs font-bold text-stone-900 dark:text-stone-100">Lab Mentor</h3>
                   <span className="inline-flex items-center gap-1 rounded bg-emerald-50 dark:bg-emerald-950/60 px-1.5 py-0.2 text-[9px] font-bold text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">
                     <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                    Gemini 3.8 Flash
+                    AI Assistant
                   </span>
                 </div>
                 <p className="text-[10px] text-stone-500 dark:text-stone-400 truncate max-w-[200px] sm:max-w-[260px]">

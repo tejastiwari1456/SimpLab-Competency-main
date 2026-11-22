@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   FlaskConical,
   GraduationCap,
@@ -22,21 +22,29 @@ interface LoginPageProps {
   onLoginSuccess: (user: CurrentUser, token: string) => void;
   onNavigate: (path: string) => void;
   isDark: boolean;
+  initialRole?: UserRole;
 }
 
 export const LoginPage: React.FC<LoginPageProps> = ({
   onLoginSuccess,
   onNavigate,
   isDark,
+  initialRole,
 }) => {
-  const { login, setSession } = useAuth();
+  const { login, loginWithGoogle, setSession } = useAuth();
   const [email, setEmail] = useState<string>('');
   const [password, setPassword] = useState<string>('');
-  const [role, setRole] = useState<UserRole>('student');
+  const [role, setRole] = useState<UserRole>(initialRole || 'student');
   const [showPassword, setShowPassword] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (initialRole) {
+      setRole(initialRole);
+    }
+  }, [initialRole]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -58,7 +66,6 @@ export const LoginPage: React.FC<LoginPageProps> = ({
         return;
       }
 
-      // Synchronize session token and user state immediately
       setSession(result.user, result.token);
       setSuccessMessage(`Welcome back, ${result.user.name}!`);
 
@@ -66,16 +73,40 @@ export const LoginPage: React.FC<LoginPageProps> = ({
         onLoginSuccess(result.user!, result.token!);
         const roleRoute = (result.user!.role || 'student').toLowerCase();
         onNavigate(`/${roleRoute}/dashboard`);
-      }, 400);
+      }, 250);
     } catch (err: any) {
       setErrorMessage(err.message || 'Network connection failed. Please check your connection.');
       setIsLoading(false);
     }
   };
 
-  const handleDemoFill = (demoEmail: string, demoRole: UserRole) => {
+  const handleGoogleLogin = async () => {
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    setIsLoading(true);
+    try {
+      const result = await loginWithGoogle(role);
+      if (!result.success || !result.user || !result.token) {
+        setErrorMessage(result.error || 'Google sign-in failed.');
+        setIsLoading(false);
+        return;
+      }
+      setSession(result.user, result.token);
+      setSuccessMessage(`Welcome, ${result.user.name}!`);
+      setTimeout(() => {
+        onLoginSuccess(result.user!, result.token!);
+        const roleRoute = (result.user!.role || 'student').toLowerCase();
+        onNavigate(`/${roleRoute}/dashboard`);
+      }, 250);
+    } catch (err: any) {
+      setErrorMessage(err?.message || 'Google sign-in failed.');
+      setIsLoading(false);
+    }
+  };
+
+  const handleDemoFill = (demoEmail: string, demoRole: UserRole, demoPassword = 'password123') => {
     setEmail(demoEmail);
-    setPassword('password123');
+    setPassword(demoPassword);
     setRole(demoRole);
     setErrorMessage(null);
   };
@@ -96,7 +127,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
             className="inline-flex items-center gap-1.5 text-xs font-semibold text-stone-600 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-100 transition-colors"
           >
             <ArrowLeft className="h-3.5 w-3.5" />
-            <span>Return to Virtual Lab</span>
+            <span>Back to SimLab Overview</span>
           </button>
         </div>
 
@@ -271,6 +302,34 @@ export const LoginPage: React.FC<LoginPageProps> = ({
             </button>
           </form>
 
+          {/* Firebase Google Sign-In */}
+          {role !== 'admin' && (
+            <div className="mt-4">
+              <div className="relative flex items-center justify-center my-3">
+                <div className="w-full border-t border-stone-200 dark:border-stone-800" />
+                <span className="bg-white dark:bg-stone-900 px-2.5 text-[10px] font-semibold uppercase tracking-wider text-stone-400 whitespace-nowrap">
+                  Or continue with SSO
+                </span>
+                <div className="w-full border-t border-stone-200 dark:border-stone-800" />
+              </div>
+              <button
+                type="button"
+                id="google-signin-btn"
+                disabled={isLoading}
+                onClick={handleGoogleLogin}
+                className="w-full flex items-center justify-center gap-2 rounded-xl border border-stone-300 dark:border-stone-700 bg-white dark:bg-stone-800 py-2.5 px-4 text-xs font-semibold text-stone-800 dark:text-stone-100 hover:bg-stone-50 dark:hover:bg-stone-750 disabled:opacity-50 transition-colors cursor-pointer"
+              >
+                <svg className="h-4 w-4" viewBox="0 0 24 24" aria-hidden="true">
+                  <path fill="#4285F4" d="M23.745 12.27c0-.79-.07-1.54-.19-2.27h-11.3v4.51h6.47c-.29 1.48-1.14 2.73-2.4 3.58v3h3.86c2.26-2.09 3.56-5.17 3.56-8.82z" />
+                  <path fill="#34A853" d="M12.255 24c3.24 0 5.95-1.08 7.93-2.91l-3.86-3c-1.08.72-2.45 1.16-4.07 1.16-3.13 0-5.78-2.11-6.73-4.96h-3.98v3.09C3.515 21.3 7.565 24 12.255 24z" />
+                  <path fill="#FBBC05" d="M5.525 14.29c-.25-.72-.38-1.49-.38-2.29s.14-1.57.38-2.29V6.62h-3.98a11.86 11.86 0 0 0 0 10.76l3.98-3.09z" />
+                  <path fill="#EA4335" d="M12.255 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C18.205 1.19 15.495 0 12.255 0c-4.69 0-8.74 2.7-10.71 6.62l3.98 3.09c.95-2.85 3.6-4.96 6.73-4.96z" />
+                </svg>
+                <span>Sign in with Google ({role === 'teacher' ? 'Faculty' : 'Student'})</span>
+              </button>
+            </div>
+          )}
+
           {/* Quick Demo Logins Helper */}
           <div className="mt-6 pt-5 border-t border-stone-100 dark:border-stone-800">
             <div className="flex items-center justify-between mb-2.5">
@@ -285,7 +344,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
               <button
                 type="button"
                 id="demo-student-login-btn"
-                onClick={() => handleDemoFill('aarav.sharma@university.edu', 'student')}
+                onClick={() => handleDemoFill('aarav.sharma@university.edu', 'student', 'password123')}
                 className="flex flex-col items-start p-2 rounded-lg border border-stone-200 dark:border-stone-800 bg-stone-50 dark:bg-stone-800/60 hover:border-amber-400 dark:hover:border-amber-500/80 transition-all text-left cursor-pointer"
               >
                 <div className="flex items-center gap-1 text-xs font-semibold text-stone-800 dark:text-stone-200">
@@ -300,7 +359,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
               <button
                 type="button"
                 id="demo-teacher-login-btn"
-                onClick={() => handleDemoFill('dr.ananya.sen@university.edu', 'teacher')}
+                onClick={() => handleDemoFill('dr.ananya.sen@university.edu', 'teacher', 'password123')}
                 className="flex flex-col items-start p-2 rounded-lg border border-stone-200 dark:border-stone-800 bg-stone-50 dark:bg-stone-800/60 hover:border-amber-400 dark:hover:border-amber-500/80 transition-all text-left cursor-pointer"
               >
                 <div className="flex items-center gap-1 text-xs font-semibold text-stone-800 dark:text-stone-200">
@@ -315,7 +374,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
               <button
                 type="button"
                 id="demo-admin-login-btn"
-                onClick={() => handleDemoFill('super.admin@simlab.internal', 'admin')}
+                onClick={() => handleDemoFill('admin.lead@university.edu', 'admin', 'Admin@SimLab2026!')}
                 className="flex flex-col items-start p-2 rounded-lg border border-stone-200 dark:border-stone-800 bg-stone-50 dark:bg-stone-800/60 hover:border-amber-400 dark:hover:border-amber-500/80 transition-all text-left cursor-pointer"
               >
                 <div className="flex items-center gap-1 text-xs font-semibold text-stone-800 dark:text-stone-200">
@@ -323,7 +382,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
                   <span>Admin</span>
                 </div>
                 <span className="text-[10px] text-stone-500 dark:text-stone-400 truncate w-full mt-0.5">
-                  super.admin@...
+                  admin.lead@...
                 </span>
               </button>
             </div>

@@ -1,38 +1,28 @@
-
 import "dotenv/config";
 import { Pool } from "pg";
 import fs from "node:fs";
 import path from "node:path";
 
 async function main() {
-  // Connect directly to the real PostgreSQL database.
-  // This script deliberately does not use SimLab's in-memory fallback.
-  const pool = new Pool(
-    process.env.DATABASE_URL
-      ? {
-          connectionString: process.env.DATABASE_URL,
-          connectionTimeoutMillis: 5000,
-        }
-      : {
-          host: process.env.SQL_HOST || "127.0.0.1",
-          port: Number(process.env.SQL_PORT || process.env.PGPORT || 5432),
-          database: process.env.SQL_DB_NAME || "simlab",
-          user: process.env.SQL_USER || "postgres",
-          password: process.env.SQL_PASSWORD,
-          connectionTimeoutMillis: 5000,
-        }
-  );
+  // Connect directly to Cloud SQL PostgreSQL using Object Method (SQL_* env vars).
+  const pool = new Pool({
+    host: process.env.SQL_HOST,
+    user: process.env.SQL_ADMIN_USER || process.env.SQL_USER,
+    password: process.env.SQL_ADMIN_PASSWORD || process.env.SQL_PASSWORD,
+    database: process.env.SQL_DB_NAME,
+    max: 5,
+    connectionTimeoutMillis: 15000,
+  });
 
   try {
     const client = await pool.connect();
 
     try {
-      const db = await client.query(
+      const dbInfo = await client.query(
         "SELECT current_database() AS database, current_user AS username"
       );
-
-      console.log("Connected to:", db.rows[0].database);
-      console.log("Database user:", db.rows[0].username);
+      console.log("Connected to:", dbInfo.rows[0].database);
+      console.log("Database user:", dbInfo.rows[0].username);
 
       await client.query(`
         CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -42,7 +32,6 @@ async function main() {
       `);
 
       const migrationsDir = path.resolve(process.cwd(), "migrations");
-
       if (!fs.existsSync(migrationsDir)) {
         throw new Error(`Migrations directory not found: ${migrationsDir}`);
       }
@@ -52,66 +41,26 @@ async function main() {
         .filter((file) => /^\d+_[\w-]+\.sql$/.test(file))
         .sort();
 
-      if (files.length === 0) {
-        console.log("No SQL migration files found.");
-        return;
-      }
-
       for (const filename of files) {
         const alreadyApplied = await client.query(
           "SELECT 1 FROM schema_migrations WHERE filename = $1",
           [filename]
         );
-
         if (alreadyApplied.rowCount) {
           console.log(`Skipping ${filename} (already applied).`);
           continue;
         }
 
-        // The authentication schema was previously applied by
-        // SimLab's auth service, which did not track migration history.
-        // Baseline it only when all four auth tables already exist.
-        if (filename === "001_auth_schema.sql") {
-          const existing = await client.query(`
-            SELECT
-              to_regclass('public.users') IS NOT NULL AS users,
-              to_regclass('public.sessions') IS NOT NULL AS sessions,
-              to_regclass('public.auth_events') IS NOT NULL AS auth_events,
-              to_regclass('public.password_resets') IS NOT NULL
-                AS password_resets
-          `);
-
-          const authSchemaExists = Object.values(existing.rows[0])
-            .every(Boolean);
-
-          if (authSchemaExists) {
-            await client.query(
-              "INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING",
-              [filename]
-            );
-
-            console.log(`Recorded existing schema: ${filename}`);
-            continue;
-          }
-        }
-
-        const sql = fs.readFileSync(
-          path.join(migrationsDir, filename),
-          "utf8"
-        );
-
+        const sql = fs.readFileSync(path.join(migrationsDir, filename), "utf8");
         console.log(`Applying ${filename}...`);
 
         await client.query("BEGIN");
-
         try {
           await client.query(sql);
-
           await client.query(
-            "INSERT INTO schema_migrations (filename) VALUES ($1)",
+            "INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING",
             [filename]
           );
-
           await client.query("COMMIT");
           console.log(`Applied successfully: ${filename}`);
         } catch (error) {

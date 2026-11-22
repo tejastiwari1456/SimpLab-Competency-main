@@ -17,6 +17,13 @@ export const EXPERIMENTS: Experiment[] = [
       'Calculate electrical resistance using linear regression slope (R = ΔV/ΔI) and calculate wire resistivity.',
       'Recognize non-ohmic departure caused by thermal heating under excessive current.',
     ],
+    procedureSteps: [
+      'Inspect the DC voltmeter (0–12V) and select the 500mA ammeter range for maximum resolution without overload.',
+      'Close the key switch and verify zero-load readings before sweeping supply voltage (V_supply) from 1.0V to 6.0V.',
+      'Adjust the series rheostat to collect at least 5 distinct (V, I) data points in the linear ohmic region (power < 3.0W).',
+      'Toggle the loose contact fault briefly to observe abnormal contact-resistance drop, then clear the fault before final logging.',
+      'Inspect the V vs I linear regression slope (R = ΔV/ΔI) and R² fit, then complete the auto-graded tasks and adaptive AI Viva.',
+    ],
     apparatusList: [
       'Regulated DC Power Supply (0–12V)',
       'Digital / Analog DC Voltmeter (0–10V, 0.05V resolution)',
@@ -119,6 +126,13 @@ export const EXPERIMENTS: Experiment[] = [
       'Record pH progression upon precise dropwise additions of 0.1M titrant from a class-A 50mL burette.',
       'Plot pH vs Volume curve and determine exact equivalence volume via ΔpH/ΔV derivative inflection.',
       'Evaluate color indicator dissociation range vs electrochemical potentiometric inflection.',
+    ],
+    procedureSteps: [
+      'Verify the 25.0 mL HCl analyte flask is centered on the magnetic stirrer and the pH probe is calibrated.',
+      'Add 0.100 M NaOH titrant in 2.0 mL increments while pH remains below 3.0 to map the baseline buffer region.',
+      'Switch to fine 0.1–0.2 mL dropwise additions near pH 3.5–10.5 to capture the sharp equivalence inflection.',
+      'Identify the equivalence volume (V_eq) from the peak of the ΔpH/ΔV curve and calculate unknown HCl molarity.',
+      'Complete the validation checks and defend your indicator selection in the adaptive AI Viva.',
     ],
     apparatusList: [
       'Precision 50 mL Class-A Glass Burette (0.05 mL graduated)',
@@ -223,6 +237,13 @@ export const EXPERIMENTS: Experiment[] = [
       'Verify that photocurrent magnitude scales proportionally with intensity, validating photon flux theory.',
       'Plot stopping potential (V₀) vs light frequency (f) to deduce Planck’s constant (h) and cathode work function (Φ).',
     ],
+    procedureSteps: [
+      'Select a short monochromatic wavelength (e.g., 380nm–436nm) and confirm measurable photocurrent on the picoammeter.',
+      'Gradually increase the reverse retarding voltage until photocurrent reaches 0.00 nA to record stopping potential V₀.',
+      'Double light intensity at the same wavelength to confirm V₀ stays invariant while saturation current scales linearly.',
+      'Repeat across at least 4 wavelengths above the threshold frequency to extract the linear V₀ vs f slope.',
+      'Compute Planck’s constant (h = e · slope) and complete the auto-graded tasks and adaptive AI Viva.',
+    ],
     apparatusList: [
       'Monochromatic Tunable Light Source (380nm UV to 650nm Red filter wheel)',
       'Vacuum Phototube with Cesium/Potassium photocathode',
@@ -326,6 +347,13 @@ export const EXPERIMENTS: Experiment[] = [
       'Log u, v, 1/u, and 1/v data and calculate focal length using the thin lens formula f = (u · v) / (u + v).',
       'Analyze the u-v hyperbola curve and 1/v vs 1/u linear plot to compare empirical values with nominal lens specifications.',
       'Troubleshoot optical projector displacement issues where images form behind the screen plane.',
+    ],
+    procedureSteps: [
+      'Turn on the illuminated object upright, verify the convex lens nominal focal length (15.0 cm), and enable the ray diagram.',
+      'Position the object upright across multiple regimes (u > 2f, u = 2f, and f < u < 2f) while keeping the lens centered.',
+      'Slide the projection screen until Image Sharpness reaches ≥95% (or use fine ±0.1 cm steps to eliminate circle-of-confusion blur).',
+      'Log at least 5 sharp (u, v) conjugate trials and inspect both the u-v hyperbola and 1/v vs 1/u linear regression.',
+      'Test u < f briefly to observe virtual image formation, then complete the validation tasks and adaptive AI Viva.',
     ],
     apparatusList: [
       'Dual-rail Optical Bench (0–120 cm) with mm graduated scale and leveling screws',
@@ -493,6 +521,13 @@ export const EXPERIMENTS: Experiment[] = [
       'Cast, submerge, and load a 1.5% agarose gel in 1X TAE buffer with 6X loading dye and run towards the positive anode ("run to red").',
       'Analyze molecular weight bands against a 100 bp DNA ladder under UV transillumination to verify the 500 bp amplicon.',
       'Diagnose experimental failures including reagent omissions, false positives from NTC contamination, and non-specific mispriming.',
+    ],
+    procedureSteps: [
+      'Assemble the 25 µL PCR reactions (Sample, Positive Control, and No-Template Negative Control) with fresh barrier tips.',
+      'Configure the thermal cycler for 30 cycles: 95°C denaturation, 55°C primer annealing (Tm − 5°C), and 72°C Taq extension.',
+      'Prepare and load the 1.5% agarose gel in 1X TAE buffer with the 100 bp DNA ladder and run toward the red positive anode.',
+      'Inspect the UV transilluminator gel bands to verify the 500 bp target amplicon and confirm the NTC lane is clean.',
+      'Complete the molecular sizing and troubleshooting tasks followed by the adaptive AI Viva defense.',
     ],
     apparatusList: [
       'Adjustable Micropipettes (P10: 0.5–10 µL, P20: 2–20 µL, P200: 20–200 µL) with sterile aerosol-barrier tips',

@@ -34,7 +34,7 @@ export const AdminLayout: React.FC<AdminLayoutProps> = ({
       case '/admin/audit':
         return <AdminAuditLogsView token={token} />;
       case '/admin/institutions':
-        return <AdminInstitutionsView />;
+        return <AdminInstitutionsView token={token} />;
       case '/admin/settings':
         return <AdminSettingsView />;
       case '/admin/profile':

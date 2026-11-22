@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   Zap,
   Power,
@@ -34,12 +34,18 @@ export interface OhmsDataPoint {
 
 interface OhmsLawSimProps {
   onDataLogged?: (pointsCount: number) => void;
+  onSnapshotChange?: (snapshot: {
+    observations: Record<string, unknown>;
+    calculatedResults: Record<string, unknown>;
+    readingsCount: number;
+  }) => void;
   onSafetyWarningTriggered?: () => void;
   isDark?: boolean;
 }
 
 export const OhmsLawSim: React.FC<OhmsLawSimProps> = ({
   onDataLogged,
+  onSnapshotChange,
   onSafetyWarningTriggered,
   isDark = false,
 }) => {
@@ -153,6 +159,34 @@ export const OhmsLawSim: React.FC<OhmsLawSimProps> = ({
       isValid: true,
     };
   }, [loggedPoints]);
+
+  useEffect(() => {
+    if (!onSnapshotChange) return;
+    const nominalErrorPct = regressionStats.isValid
+      ? parseFloat((Math.abs((regressionStats.slopeR - nominalR) / nominalR) * 100).toFixed(2))
+      : null;
+    onSnapshotChange({
+      observations: {
+        apparatus: 'DC Ohm Law Bench',
+        ammeterRange,
+        nominalResistanceOhm: nominalR,
+        trials: loggedPoints.map((pt, idx) => ({
+          trial: idx + 1,
+          voltageV: pt.voltage,
+          currentA: pt.current,
+          currentMA: pt.currentMA,
+          isAnomaly: Boolean(pt.isAnomaly),
+        })),
+      },
+      calculatedResults: {
+        measuredSlopeResistanceOhm: regressionStats.isValid ? regressionStats.slopeR : null,
+        rSquared: regressionStats.isValid ? regressionStats.rSquared : null,
+        nominalErrorPercent: nominalErrorPct,
+        readingsCount: loggedPoints.length,
+      },
+      readingsCount: loggedPoints.length,
+    });
+  }, [loggedPoints, regressionStats, ammeterRange, onSnapshotChange]);
 
   const handleLogDataPoint = () => {
     if (!powerOn) return;

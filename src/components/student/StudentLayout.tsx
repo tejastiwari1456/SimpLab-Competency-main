@@ -1,5 +1,16 @@
 import React, { useState } from 'react';
-import { CurrentUser, CompetencyKey, Assignment, StudentSubmission, ClassCourse } from '../../types';
+import {
+  CurrentUser,
+  CompetencyKey,
+  Assignment,
+  StudentSubmission,
+  ClassCourse,
+  StudentCompetencyReport,
+  VivaSessionRecord,
+  StudentRecommendation,
+  StudentNotification,
+} from '../../types';
+import type { ExperimentSubmitPayload } from '../../App';
 import { AppShell } from '../navigation/AppShell';
 import { StudentDashboardView } from './StudentDashboardView';
 import { StudentClassesView } from './StudentClassesView';
@@ -10,52 +21,105 @@ import { StudentScenariosView } from './StudentScenariosView';
 import { StudentProgressView } from './StudentProgressView';
 import { StudentProfileView } from './StudentProfileView';
 
+const ZERO_SCORES: Record<CompetencyKey, number> = {
+  setup_adherence: 0,
+  measurement_precision: 0,
+  data_interpretation: 0,
+  troubleshooting_safety: 0,
+  experimental_design: 0,
+};
+
 interface StudentLayoutProps {
   currentUser: CurrentUser;
+  token: string | null;
   currentPath: string;
   onNavigate: (path: string) => void;
   onLogout: () => void;
   isDark: boolean;
   onToggleDarkMode: () => void;
+  isLoadingData: boolean;
   classes: ClassCourse[];
+  studentClassesError?: string;
   assignments: Assignment[];
   submissions: StudentSubmission[];
   studentSubmissionsError: string;
   competencyScores: Record<CompetencyKey, number>;
+  competencyReport: StudentCompetencyReport | null;
   competencyScoresError: string;
+  vivaSessions: VivaSessionRecord[];
+  recommendations: StudentRecommendation[];
+  notifications: StudentNotification[];
+  unreadNotificationsCount: number;
+  onMarkNotificationRead: (key: string) => void;
+  onMarkAllNotificationsRead: () => void;
+  onRefreshStudentData: () => Promise<void>;
   onTaskCompleted: (taskId: string, score: number, competency: CompetencyKey) => void;
-  onAllCompleted: (totalScore: number, maxScore: number,assignmentId: string, experimentId: string) => Promise<void>;
+  onAllCompleted: (payload: ExperimentSubmitPayload) => Promise<StudentSubmission>;
 }
 
 export const StudentLayout: React.FC<StudentLayoutProps> = ({
   currentUser,
+  token,
   currentPath,
   onNavigate,
   onLogout,
   isDark,
   onToggleDarkMode,
+  isLoadingData,
   classes,
+  studentClassesError = '',
   assignments,
   submissions,
   studentSubmissionsError,
   competencyScores,
+  competencyReport,
   competencyScoresError,
+  vivaSessions,
+  recommendations,
+  notifications,
+  unreadNotificationsCount,
+  onMarkNotificationRead,
+  onMarkAllNotificationsRead,
+  onRefreshStudentData,
   onTaskCompleted,
   onAllCompleted,
 }) => {
   const [selectedExpId, setSelectedExpId] = useState<string>('exp-convex-lens');
 
-  // Match student sub-route
+  const classAverageScores = classes[0]?.averageCompetencies || ZERO_SCORES;
+
+  const handleLaunchExperiment = (expId: string) => {
+    setSelectedExpId(expId);
+    onNavigate('/student/experiments');
+  };
+
+  const handleNotificationSelect = (notif: StudentNotification) => {
+    if (notif.experimentId && notif.actionPath === '/student/experiments') {
+      setSelectedExpId(notif.experimentId);
+    }
+    onNavigate(notif.actionPath);
+  };
+
   const renderStudentView = () => {
     switch (currentPath) {
       case '/student/classes':
-        return <StudentClassesView classes={classes} onNavigate={onNavigate} />;
+        return (
+          <StudentClassesView
+            classes={classes}
+            error={studentClassesError}
+            onNavigate={onNavigate}
+          />
+        );
       case '/student/experiments':
         return (
           <StudentExperimentsView
             selectedExpId={selectedExpId}
             assignments={assignments}
             onSelectExperiment={setSelectedExpId}
+            onNavigate={onNavigate}
+            onVivaCompleted={() => {
+              void onRefreshStudentData();
+            }}
             onTaskCompleted={onTaskCompleted}
             onAllCompleted={onAllCompleted}
             isDark={isDark}
@@ -65,6 +129,8 @@ export const StudentLayout: React.FC<StudentLayoutProps> = ({
         return (
           <StudentAssignmentsView
             assignments={assignments}
+            submissions={submissions}
+            isLoading={isLoadingData}
             onSelectExperiment={setSelectedExpId}
             onNavigate={onNavigate}
           />
@@ -72,16 +138,17 @@ export const StudentLayout: React.FC<StudentLayoutProps> = ({
       case '/student/competencies':
         return (
           <StudentCompetenciesView
+            currentUser={currentUser}
+            token={token}
+            isLoading={isLoadingData}
             submissions={submissions}
             activeScores={competencyScores}
+            competencyReport={competencyReport}
             competencyScoresError={competencyScoresError}
-            classAverageScores={classes[0]?.averageCompetencies || {
-              setup_adherence: 80,
-              measurement_precision: 75,
-              data_interpretation: 78,
-              troubleshooting_safety: 82,
-              experimental_design: 76,
-            }}
+            classAverageScores={classAverageScores}
+            vivaSessions={vivaSessions}
+            recommendations={recommendations}
+            onLaunchExperiment={handleLaunchExperiment}
             isDark={isDark}
           />
         );
@@ -90,14 +157,13 @@ export const StudentLayout: React.FC<StudentLayoutProps> = ({
       case '/student/progress':
         return (
           <StudentProgressView
+            token={token}
             competencyScores={competencyScores}
+            competencyReport={competencyReport}
             submissions={submissions}
+            vivaSessions={vivaSessions}
             currentUser={currentUser}
-            onPractice={(expId) => {
-              setSelectedExpId(expId);
-              onNavigate('/student/experiments');
-            }}
-            onTaskCompleted={onTaskCompleted}
+            onPractice={handleLaunchExperiment}
           />
         );
       case '/student/profile':
@@ -113,10 +179,19 @@ export const StudentLayout: React.FC<StudentLayoutProps> = ({
         return (
           <StudentDashboardView
             currentUser={currentUser}
+            isLoading={isLoadingData}
+            classes={classes}
             competencyScores={competencyScores}
+            competencyReport={competencyReport}
+            classAverageScores={classAverageScores}
             assignments={assignments}
             submissions={submissions}
+            vivaSessions={vivaSessions}
+            recommendations={recommendations}
+            notifications={notifications}
             studentSubmissionsError={studentSubmissionsError}
+            onMarkNotificationRead={onMarkNotificationRead}
+            onNotificationSelect={handleNotificationSelect}
             onNavigate={onNavigate}
             onSelectExperiment={setSelectedExpId}
             isDark={isDark}
@@ -135,6 +210,11 @@ export const StudentLayout: React.FC<StudentLayoutProps> = ({
       onLogout={onLogout}
       isDark={isDark}
       onToggleDarkMode={onToggleDarkMode}
+      studentNotifications={notifications}
+      unreadNotificationsCount={unreadNotificationsCount}
+      onMarkNotificationRead={onMarkNotificationRead}
+      onMarkAllNotificationsRead={onMarkAllNotificationsRead}
+      onNotificationSelect={handleNotificationSelect}
     >
       {renderStudentView()}
     </AppShell>

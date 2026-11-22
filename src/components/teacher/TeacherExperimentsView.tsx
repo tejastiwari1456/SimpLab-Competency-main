@@ -32,7 +32,7 @@ export const TeacherExperimentsView: React.FC<TeacherExperimentsViewProps> = ({
       new Set(
         experiments
           .map((e) => e.subject)
-          .filter((sub): sub is string => Boolean(sub))
+          .filter((sub): sub is Experiment['subject'] => Boolean(sub))
       )
     ),
   ];

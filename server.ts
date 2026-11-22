@@ -3,1126 +3,1067 @@ import http from "http";
 import crypto from "crypto";
 import express, { Request, Response } from "express";
 import path from "path";
-import { fileURLToPath } from "url";
-import dotenv from "dotenv";
-import { GoogleGenAI } from "@google/genai";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { createServer as createViteServer } from "vite";
-import { setupPairLabServer } from "./pairLabServer";
-import { authRouter } from "./auth.controller";
-import { requireAuth, requireRole, extractToken, AuthenticatedRequest } from "./auth.middleware";
-import { authService } from "./auth.service";
-
-dotenv.config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+import { setupPairLabServer } from "./pairLabServer.ts";
+import { authRouter } from "./auth.controller.ts";
+import { requireAuth, requireRole, AuthenticatedRequest } from "./auth.middleware.ts";
+import { authService } from "./auth.service.ts";
+import { db } from "./src/db/index.ts";
+import {
+  assignments,
+  authEvents,
+  classes,
+  classEnrollments,
+  sessions,
+  submissions,
+  users,
+} from "./src/db/schema.ts";
+import {
+  evaluateVivaWithGemini,
+  GeminiServiceError,
+  generateMentorReplyWithGemini,
+  generateSocraticHintWithGemini,
+  isGeminiConfigured,
+} from "./src/server/geminiClient.ts";
+import {
+  completeVivaSession,
+  getStudentVivaSessions,
+  getVivaSessionById,
+  startVivaSession,
+  submitVivaAnswer,
+} from "./src/server/vivaService.ts";
+import {
+  createStudentSubmission,
+  evaluateSubmissionByFaculty,
+  getAdminInstitutionsSummary,
+  getAllSubmissionsAdmin,
+  getStudentCompetencyReport,
+  getStudentExperimentsStatus,
+  getStudentSubmissionsList,
+  getSubmissionById,
+  getTeacherClassStudents,
+  getTeacherSubmissionsList,
+  syncCompetenciesAfterVivaCompletion,
+} from "./src/server/submissionService.ts";
+import { getExperimentById } from "./src/server/experimentCatalog.ts";
+import { getStudentRecommendations } from "./src/server/recommendationEngine.ts";
+import {
+  getPersistentNotificationsForUser,
+  getStudentNotifications,
+  markAllNotificationsRead,
+  markAllPersistentNotificationsRead,
+  markNotificationRead,
+  markPersistentNotificationRead,
+} from "./src/server/notificationService.ts";
+import {
+  buildFacultyCsvExport,
+  generateFacultyAiInsights,
+  getAuthorizedStudentReportForTeacher,
+  getFacultyCompetencyAnalytics,
+  getFacultyDashboardSummary,
+  getFacultyHistoricalReport,
+} from "./src/server/facultyService.ts";
+import {
+  assignFacultyToClassByAdmin,
+  enrollExistingStudentByAdmin,
+  listAvailableClassesForRegistration,
+  listClassesForAdmin,
+} from "./src/server/enrollmentService.ts";
 
 const app = express();
 const PORT = 3000;
 
-// Security Headers Middleware (Requirement 26)
+// Security headers compatible with iframe embedding
 app.use((_req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("X-Frame-Options", "SAMEORIGIN");
-  res.setHeader("X-XSS-Protection", "1; mode=block");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
   next();
 });
 
-// JSON Body Parser with safe payload size limit
 app.use(express.json({ limit: "1mb" }));
 
-// Lazy-initialized Gemini client with required User-Agent header
-let geminiClient: GoogleGenAI | null = null;
-function getGeminiClient(): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === "MY_GEMINI_API_KEY" || apiKey.trim() === "") {
-    return null;
-  }
-  if (!geminiClient) {
-    geminiClient = new GoogleGenAI({
-      apiKey: apiKey,
-      httpOptions: {
-        headers: {
-          "User-Agent": "aistudio-build",
-        },
-      },
+/**
+ * Helper to translate typed service errors into clean HTTP status codes
+ */
+function handleServiceError(res: Response, error: any, fallbackMessage: string) {
+  if (error instanceof GeminiServiceError) {
+    return res.status(error.statusCode).json({
+      success: false,
+      code: error.code,
+      error: error.message,
     });
   }
-  return geminiClient;
-}
-
-// Resilient multi-tier model calling with retry on transient capacity spikes (503 / 429)
-interface GeminiCallResult {
-  text: string;
-  source: string;
-}
-
-async function callGeminiWithResilience(
-  ai: GoogleGenAI,
-  contents: string,
-  config?: any
-): Promise<GeminiCallResult | null> {
-  // Primary model: gemini-3.8-flash; High-availability fallback: gemini-3.1-flash-lite
-  const candidateModels = ["gemini-3.8-flash", "gemini-3.1-flash-lite"];
-
-  for (const model of candidateModels) {
-    try {
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("Timeout: Model call exceeded 3500ms")), 3500)
-      );
-      const generatePromise = ai.models.generateContent({
-        model,
-        contents,
-        config,
-      });
-
-      const response = await Promise.race([generatePromise, timeoutPromise]);
-      const text = response.text?.trim();
-      if (text) {
-        return { text, source: model };
-      }
-    } catch (err: any) {
-      console.warn(`[Gemini Resilience] ${model} unavailable (${err?.message || err?.status || 'transient'}). Trying next option...`);
-    }
+  const msg = typeof error?.message === "string" ? error.message : fallbackMessage;
+  if (msg.startsWith("BAD_REQUEST:")) {
+    return res.status(400).json({ success: false, error: msg.replace("BAD_REQUEST:", "").trim() });
   }
-
-  return null;
-}
-
-// Heuristic fallback for viva assessment when AI models are experiencing high demand or offline
-function getHeuristicVivaEvaluation(studentAnswer: string = "", question: string = "") {
-  const answerLower = studentAnswer.toLowerCase();
-  const length = studentAnswer.trim().split(/\s+/).length;
-  let score = Math.min(85, Math.max(50, length * 5));
-
-  // Check relevant STEM concepts
-  if (
-    answerLower.includes("temperature") ||
-    answerLower.includes("resistance") ||
-    answerLower.includes("heating") ||
-    answerLower.includes("logarithm") ||
-    answerLower.includes("photon") ||
-    answerLower.includes("voltage") ||
-    answerLower.includes("slope") ||
-    answerLower.includes("anneal") ||
-    answerLower.includes("primer") ||
-    answerLower.includes("buffer") ||
-    answerLower.includes("focal") ||
-    answerLower.includes("convex")
-  ) {
-    score += 15;
+  if (msg.startsWith("INVALID_CLASS:")) {
+    return res.status(400).json({ success: false, code: "INVALID_CLASS", error: msg.replace("INVALID_CLASS:", "").trim() });
   }
-  score = Math.min(98, score);
-
-  return {
-    score,
-    passed: score >= 70,
-    rubricCriterionMet: ["Identified core physical/chemical phenomenon", "Used standard laboratory terminology"],
-    missingConcepts: length < 10 ? ["Deeper mathematical derivation or quantitative relationship"] : [],
-    feedback: `Demonstrates sound conceptual recognition (${score}%). Good articulation of the primary cause, consider expanding on quantitative boundary limits.`,
-    adaptiveFollowUp: `How would your conclusion change if the temperature was held strictly constant or the component tolerances were doubled?`,
-  };
-}
-
-// Domain-specific expert Socratic mentor rule engine covering all syllabus virtual lab experiments
-function getHeuristicMentorReply(experimentId?: string, question: string = ""): string {
-  const qLower = question.toLowerCase();
-
-  if (
-    experimentId === "exp-ohms-law" ||
-    qLower.includes("ohm") ||
-    qLower.includes("voltage") ||
-    qLower.includes("current") ||
-    qLower.includes("resistance")
-  ) {
-    if (qLower.includes("zero") || qLower.includes("not moving") || qLower.includes("0") || qLower.includes("ammeter") || qLower.includes("stuck")) {
-      return `Here are the immediate checks to resolve a zero-current reading:
-• **Circuit Continuity**: Ensure the DC power supply switch is turned **ON** and voltage is dialed above **0.0 V**.
-• **Polarity Alignment**: Verify the digital ammeter is connected in **series** with the positive terminal connected to the positive supply.
-• **Rheostat / Resistance setting**: Make sure the wire resistance is not open-circuited. Once voltage is set to even 1.0 V, you should observe current register immediately according to $I = V / R$.`;
-    } else if (qLower.includes("slope") || qLower.includes("graph") || qLower.includes("calculate") || qLower.includes("resistance")) {
-      return `To calculate the experimental resistance from your $V\\text{--}I$ graph:
-1. **Identify Two Coordinates**: Pick two points $(I_1, V_1)$ and $(I_2, V_2)$ along the linear section of your plot.
-2. **Calculate the Slope**: $\\text{Slope} = \\frac{\\Delta V}{\\Delta I} = \\frac{V_2 - V_1}{I_2 - I_1}$.
-3. **Unit Watch**: Note if your ammeter is measuring in milliamperes ($\\text{mA}$). Convert to Amperes by dividing by 1,000 (e.g., $100\\text{ mA} = 0.1\\text{ A}$) before taking the ratio to get the correct Ohms ($\\Omega$).`;
-    } else if (qLower.includes("hot") || qLower.includes("heat") || qLower.includes("burn") || qLower.includes("curve") || qLower.includes("deviate")) {
-      return `At higher voltages (> 10V), you will notice the $V\\text{--}I$ plot curve slightly upwards:
-• **Joule Heating**: Electrical power dissipated as heat is given by $P = I^2 R$.
-• **Temperature Coefficient**: As wire temperature increases, thermal vibration of metal ions increases resistance: $R(T) = R_0 (1 + \\alpha \\Delta T)$.
-• **Remedy**: Take readings promptly and avoid leaving the voltage pegged at maximum to prevent thermal drift and burnout!`;
-    } else {
-      return `In Ohm's Law verification ($V = I \\cdot R$):
-• Start with voltage at **0V** and advance in **1V increments** up to ~8V.
-• Record both Voltage ($V$) and Current ($I$) in your observation table for each increment.
-• Notice how the ratio $V/I$ remains constant until Joule heating sets in. What specific step can I help you troubleshoot right now?`;
-    }
-  } else if (
-    experimentId === "exp-titration" ||
-    qLower.includes("titrat") ||
-    qLower.includes("acid") ||
-    qLower.includes("base") ||
-    qLower.includes("ph") ||
-    qLower.includes("burette")
-  ) {
-    if (qLower.includes("pink") || qLower.includes("color") || qLower.includes("endpoint") || qLower.includes("jump") || qLower.includes("magenta")) {
-      return `Here is how to master the phenolphthalein end-point:
-• **Sharp Equivalence Transition**: Phenolphthalein changes from colorless to faint pink in the pH range of **8.2 to 10.0**.
-• **Near the Equivalence Point (~20-25 mL)**: Add NaOH in small fractions (0.2 mL to 0.5 mL) or single drops while gently swirling the flask.
-• **Over-Titration Warning**: If the liquid turns hot dark magenta, you have over-titrated! The true stoichiometric endpoint is the **faintest persistent pale pink** that lingers for 30 seconds.`;
-    } else if (qLower.includes("molarity") || qLower.includes("calculate") || qLower.includes("formula") || qLower.includes("concentration")) {
-      return `To calculate the unknown molarity of HCl:
-• Use the neutralization equivalence formula:
-$$M_{\\text{acid}} \\times V_{\\text{acid}} = M_{\\text{base}} \\times V_{\\text{base}}$$
-• Since $\\text{HCl} + \\text{NaOH} \\rightarrow \\text{NaCl} + \\text{H}_2\\text{O}$ has a $1:1$ stoichiometric ratio:
-$$M_{\\text{HCl}} = \\frac{M_{\\text{NaOH}} \\times V_{\\text{NaOH, eq}}}{V_{\\text{HCl}}}$$
-• Insert your known standard base molarity ($0.10\\text{ M}$) and pipetted acid aliquot ($25.0\\text{ mL}$) with your observed equivalence volume.`;
-    } else {
-      return `For standard Acid-Base Potentiometric Titration:
-• Ensure the burette is filled to the 0.00 mL mark with standardized NaOH.
-• Use the burette stopcock slider to dispense NaOH in ~1-2 mL increments initially, slowing down to **0.5 mL drops** when approaching pH 6.0.
-• Plot the pH curve to locate the point of maximum inflection $(\\frac{d(\\text{pH})}{dV})$. Where are you currently stuck?`;
-    }
-  } else if (
-    experimentId === "exp-photoelectric" ||
-    qLower.includes("photo") ||
-    qLower.includes("electron") ||
-    qLower.includes("stopping") ||
-    qLower.includes("planck")
-  ) {
-    if (qLower.includes("stopping") || qLower.includes("retarding") || qLower.includes("zero") || qLower.includes("negative")) {
-      return `Understanding Stopping Potential ($V_0$):
-• Emitted photoelectrons leave the cathode with kinetic energies up to $K_{\\max} = \\frac{1}{2} m v_{\\max}^2$.
-• Applying a **negative (retarding) voltage** to the anode repels the arriving electrons.
-• When the electric potential barrier equals the maximum kinetic energy:
-$$e V_0 = K_{\\max}$$
-• Dial the voltage negatively until the digital nano-ammeter reads **exactly 0.000 nA**. That voltage is your experimental $V_0$.`;
-    } else if (qLower.includes("red") || qLower.includes("threshold") || qLower.includes("no current") || qLower.includes("frequency")) {
-      return `Why doesn't Red Light produce any photocurrent?
-• According to Einstein's photoelectric equation:
-$$K_{\\max} = h\\nu - \\Phi$$
-• Red light has a long wavelength ($\\approx 650\\text{--}700\\text{ nm}$) and low frequency ($\\nu < \\nu_0$). Each incoming photon possesses insufficient energy ($E = h\\nu$) to overcome the material's work function ($\\Phi \\approx 2.14\\text{ eV}$).
-• **Solution**: Switch to Green ($532\\text{ nm}$) or Violet/UV ($405\\text{ nm}$) where photon energy exceeds $\\Phi$!`;
-    } else {
-      return `In the Photoelectric Effect experiment:
-• Select an incident light wavelength (Violet $405\\text{ nm}$ or Blue $470\\text{ nm}$).
-• Notice that increasing **Intensity** increases the quantity of electrons (higher saturation current), but **does NOT change the stopping voltage**.
-• Stopping voltage ($V_0$) depends purely on **frequency/wavelength**! Which aspect can I guide you through?`;
-    }
-  } else if (
-    experimentId === "exp-convex-lens" ||
-    qLower.includes("lens") ||
-    qLower.includes("focal") ||
-    qLower.includes("optics") ||
-    qLower.includes("u-v") ||
-    qLower.includes("blur")
-  ) {
-    if (qLower.includes("blur") || qLower.includes("fuzzy") || qLower.includes("defocus") || qLower.includes("not clear") || qLower.includes("sharp")) {
-      return `Here is how to eliminate image blur on the optical bench:
-• **Conjugate Plane Mismatch**: A blurred circle occurs when the screen is stationed in front of or behind the true focal plane.
-• **Theoretical Position**: Calculate the ideal image distance using $v = \\frac{u \\cdot f}{u - f}$.
-• **Adjustment**: Adjust the screen slider until the green **Sharp Real Image Obtained (95–100%)** indicator appears, or click **Auto-Focus Screen** to align immediately!
-• **Check Object Distance**: Ensure $u > f$ ($u > 15.0\\text{ cm}$). If $u < f$, refracted rays diverge into a virtual image that cannot be received on a screen.`;
-    } else if (qLower.includes("formula") || qLower.includes("calculate") || qLower.includes("focal length") || qLower.includes("f =")) {
-      return `To calculate the experimental focal length $f$:
-1. **Thin Lens Equation**: With Cartesian sign convention ($u < 0$, $v > 0$), $\\frac{1}{f} = \\frac{1}{v} - \\frac{1}{u} = \\frac{1}{v} + \\frac{1}{|u|}$.
-2. **Working Formula with Magnitudes**:
-$$f = \\frac{u \\cdot v}{u + v}$$
-3. **Example**: If $u = 30.0\\text{ cm}$ and $v = 30.2\\text{ cm}$:
-$$f = \\frac{30.0 \\times 30.2}{30.0 + 30.2} = \\frac{906.0}{60.2} \\approx 15.05\\text{ cm}$$
-4. Log at least 4 to 5 trials across different distances to calculate the mean $\\bar{f}$ and standard deviation!`;
-    } else if (qLower.includes("projector") || qLower.includes("behind screen") || qLower.includes("scenario")) {
-      return `In the Projector Troubleshooting scenario:
-• **Symptom**: The sharp image is converging $50\\text{ cm}$ *behind* the screen ($v = 450\\text{ cm}$, screen at $400\\text{ cm}$).
-• **Analysis**: To bring the image closer ($v$ must decrease from $450\\text{ cm}$ to $400\\text{ cm}$), the term $\\frac{1}{v}$ must increase.
-• **Correction**: From $\\frac{1}{v} = \\frac{1}{f} - \\frac{1}{u}$, increasing $\\frac{1}{v}$ requires decreasing $\\frac{1}{u}$, which means **increasing $u$**!
-• **Action**: Move the projection lens slightly *further* away from the internal slide (advance the spiral focus barrel outward) to pull the image forward onto the screen!`;
-    } else if (qLower.includes("virtual") || qLower.includes("real") || qLower.includes("inverted")) {
-      return `Real vs Virtual images in a convex lens:
-• **When $u > f$**: Rays physically converge on the opposite side of the lens. The image is **Real, Inverted**, and can be projected onto the frosted screen.
-  - At $u > 2f$: Diminished ($|m| < 1$)
-  - At $u = 2f$: Equal size ($|m| = 1$, $v = 2f$)
-  - At $f < u < 2f$: Magnified ($|m| > 1$, $v > 2f$)
-• **When $u < f$**: Rays diverge after refraction. Tracing backwards gives an **Erect, Magnified, Virtual** image behind the lens that cannot be projected on a screen!`;
-    } else {
-      return `In the Convex Lens Focal Length experiment ($u\\text{--}v$ method):
-• Adjust the **Object upright (x_obj)** to set your object distance $u = |x_{lens} - x_{obj}|$.
-• Adjust the **Screen upright (x_screen)** until the image is crisp and sharp (100% focus).
-• Click **Log Current Trial** to record $u$, $v$, $\\frac{1}{u}$, and $\\frac{1}{v}$.
-• Review the $u\\text{--}v$ hyperbola and $\\frac{1}{v}$ vs $\\frac{1}{u}$ graphs to verify $f \\approx 15.0\\text{ cm}$. What would you like help with?`;
-    }
-  } else if (
-    experimentId === "exp-pcr-gel" ||
-    qLower.includes("pcr") ||
-    qLower.includes("gel") ||
-    qLower.includes("anneal") ||
-    qLower.includes("primer") ||
-    qLower.includes("ntc") ||
-    qLower.includes("ladder") ||
-    qLower.includes("electrophoresis")
-  ) {
-    if (qLower.includes("contamin") || qLower.includes("negative control") || qLower.includes("ntc") || qLower.includes("false positive")) {
-      return `Here is how to interpret a band in the Negative Control (NTC):
-• **Diagnosis**: A band in the NTC indicates that high-copy amplicon or target DNA contaminated one of the shared reagents (water, buffer, dNTPs, or primer stocks), or occurred via aerosol during pipetting.
-• **Clinical Impact**: Any positive test result in patient samples is invalidated because the contamination may have caused a false positive!
-• **Corrective Action**:
-  1. Decontaminate pipettes and cleanroom surfaces with 10% bleach and UV light.
-  2. Discard all working aliquots of water, buffer, dNTPs, and primers.
-  3. Use aerosol-barrier filter tips and assemble fresh reactions in a dedicated pre-PCR clean area.`;
-    } else if (qLower.includes("anneal") || qLower.includes("temperature") || qLower.includes("stringency") || qLower.includes("multiple bands") || qLower.includes("smear")) {
-      return `Understanding Annealing Temperature ($T_a$) and Specificity:
-• **Formula**: $T_a \\approx T_m - 5^\\circ\\text{C}$ (where $T_m$ is primer melting temperature).
-• **If $T_a$ is too low (< 50°C)**: Low stringency allows primers to anneal to imperfect matches across the genome, resulting in **non-specific bands and smeary background**.
-• **If $T_a$ is too high (> 65°C)**: Thermal motion prevents primers from stably binding, causing **low yield or complete failure to amplify**.
-• **Optimal setting**: For our primer pair ($T_m \\approx 60^\\circ\\text{C}$), configure $T_a = 55.0^\\circ\\text{C}$ for a single crisp 500 bp band!`;
-    } else if (qLower.includes("ladder") || qLower.includes("size") || qLower.includes("500") || qLower.includes("band")) {
-      return `Analyzing bands against the 100 bp DNA ladder:
-• **Ladder Rungs**: 100, 200, 300, 400, **500 bp (thick landmark)**, 600, 700, 800, 1000, and 1500 bp.
-• **Migration Rate**: Smaller fragments migrate faster towards the positive anode because they thread through the agarose mesh with less friction ($R_f \\propto -\\log_{10}(\\text{bp})$).
-• **Sample Interpretation**: Our target amplicon co-migrates directly with the 500 bp landmark band!`;
-    } else if (qLower.includes("red") || qLower.includes("charge") || qLower.includes("cathode") || qLower.includes("anode") || qLower.includes("polarity")) {
-      return `Agarose Gel Electrophoresis Polarity ("Run to Red"):
-• **Charge**: The DNA sugar-phosphate backbone carries negatively charged phosphate groups ($\\text{PO}_4^{3-}$).
-• **Electrode Orientation**: DNA is loaded at the cathode (negative black terminal) and migrates towards the **anode (positive red terminal)**.
-• **Mnemonic**: *"Run to Red"* — if polarity is accidentally reversed, samples will run backwards out of the wells and vanish into the buffer!`;
-    } else {
-      return `In the PCR & Agarose Gel Electrophoresis experiment:
-• **Stage 1 & 2**: Assemble the 25 µL reaction mix (Template, Primers, Taq, dNTPs, Buffer, $\\text{Mg}^{2+}$, $\\text{H}_2\\text{O}$) using sterile filter tips.
-• **Stage 3 & 4**: Pulse-vortex and spin down in the mini-centrifuge, then program the thermocycler ($95^\\circ\\text{C} \\to 55^\\circ\\text{C} \\to 72^\\circ\\text{C}$).
-• **Stage 5 & 6**: Mix with 6X loading dye, load into the submerged agarose gel, and run at 100V.
-• **Stage 7**: Inspect under UV transillumination to size the 500 bp amplicon and check controls!`;
-    }
+  if (msg.startsWith("FORBIDDEN:")) {
+    return res.status(403).json({ success: false, error: msg.replace("FORBIDDEN:", "").trim() });
   }
-
-  return `I am your **Lab Mentor** for this experiment.
-• Review the step instructions in your task panel on the right.
-• Check all instrument meter ranges, dials, and units.
-• Feel free to ask me about troubleshooting equipment faults, calculation steps, or the physical theory behind your observations!`;
+  if (msg.startsWith("NOT_FOUND:")) {
+    return res.status(404).json({ success: false, error: msg.replace("NOT_FOUND:", "").trim() });
+  }
+  if (msg.startsWith("CONFLICT:")) {
+    return res.status(409).json({ success: false, error: msg.replace("CONFLICT:", "").trim() });
+  }
+  if (msg.startsWith("DUPLICATE_ENROLLMENT:")) {
+    return res.status(409).json({ success: false, code: "DUPLICATE_ENROLLMENT", error: msg.replace("DUPLICATE_ENROLLMENT:", "").trim() });
+  }
+  if (msg.startsWith("UNASSIGNED_FACULTY:")) {
+    return res.status(422).json({ success: false, code: "UNASSIGNED_FACULTY", error: msg.replace("UNASSIGNED_FACULTY:", "").trim() });
+  }
+  console.error(`[API Error] ${fallbackMessage}:`, error);
+  return res.status(500).json({ success: false, error: fallbackMessage });
 }
 
-// In-memory assignment store for custom teacher assignments and submissions
-interface AssignmentSubmissionRecord {
-  id: string;
-  assignmentId: string;
-  studentId: string;
-  studentName: string;
-  experimentId: string;
-  submittedAt: string;
-  totalScore: number;
-  maxScore: number;
-  competencyScores: {
-    setup_adherence: number;
-    measurement_precision: number;
-    data_interpretation: number;
-    troubleshooting_safety: number;
-    experimental_design: number;
-  };
-  vivaResponses: Array<{
-    question: string;
-    studentAnswer: string;
-    score: number;
-    feedback: string;
-  }>;
-}
-
-let submissionsStore: AssignmentSubmissionRecord[] = [
-  {
-    id: "sub-101",
-    assignmentId: "asg-1",
-    studentId: "stu-1",
-    studentName: "Aarav Sharma",
-    experimentId: "exp-ohms-law",
-    submittedAt: "2026-09-14T14:20:00.000Z",
-    totalScore: 92,
-    maxScore: 100,
-    competencyScores: {
-      setup_adherence: 95,
-      measurement_precision: 88,
-      data_interpretation: 94,
-      troubleshooting_safety: 90,
-      experimental_design: 92,
-    },
-    vivaResponses: [
-      {
-        question: "Why does the V-I characteristic deviate from linearity at higher voltages?",
-        studentAnswer: "Joule heating increases the wire temperature, which raises its resistance according to the temperature coefficient.",
-        score: 95,
-        feedback: "Accurate physical explanation identifying thermal coefficient and Joule heating.",
-      },
-    ],
-  },
-  {
-    id: "sub-102",
-    assignmentId: "asg-1",
-    studentId: "stu-2",
-    studentName: "Priya Patel",
-    experimentId: "exp-ohms-law",
-    submittedAt: "2026-09-15T09:12:00.000Z",
-    totalScore: 78,
-    maxScore: 100,
-    competencyScores: {
-      setup_adherence: 85,
-      measurement_precision: 70,
-      data_interpretation: 82,
-      troubleshooting_safety: 75,
-      experimental_design: 76,
-    },
-    vivaResponses: [
-      {
-        question: "Why should the ammeter have low internal resistance?",
-        studentAnswer: "Because it connects in series so it does not drop too much voltage and alter the circuit current.",
-        score: 85,
-        feedback: "Good grasp of series burden voltage, mention negligible insertion loss for top marks.",
-      },
-    ],
-  },
-  {
-    id: "sub-103",
-    assignmentId: "asg-2",
-    studentId: "stu-3",
-    studentName: "Rahul Verma",
-    experimentId: "exp-titration",
-    submittedAt: "2026-09-15T11:45:00.000Z",
-    totalScore: 68,
-    maxScore: 100,
-    competencyScores: {
-      setup_adherence: 70,
-      measurement_precision: 60,
-      data_interpretation: 65,
-      troubleshooting_safety: 72,
-      experimental_design: 68,
-    },
-    vivaResponses: [
-      {
-        question: "Why does pH change rapidly near the equivalence point in strong acid-strong base titration?",
-        studentAnswer: "Because all the acid is gone and it becomes neutral suddenly.",
-        score: 65,
-        feedback: "Partially correct. The steep curve occurs because pH is a logarithmic scale of hydrogen ion concentration.",
-      },
-    ],
-  },
-];
-
-// --- API Endpoints ---
-
-// --- Authentication Endpoints (delegated to modular AuthController & AuthService) ---
+// ==============================================================================
+// AUTHENTICATION & PUBLIC CATALOG ENDPOINTS
+// ==============================================================================
 app.use("/api/auth", authRouter);
 
 // Health check
 app.get("/api/health", (_req: Request, res: Response) => {
   res.json({
     status: "ok",
-    geminiConfigured: !!process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY",
+    geminiConfigured: isGeminiConfigured(),
     timestamp: new Date().toISOString(),
   });
 });
 
-// AI Viva Evaluation Endpoint (evaluates short-text responses against rigorous rubric)
-app.post("/api/gemini/viva-evaluate", async (req: Request, res: Response) => {
+// Public list of enrollable classes for student registration dropdown (dynamically loaded from PostgreSQL)
+app.get("/api/classes/available", async (_req: Request, res: Response) => {
   try {
-    const { question, studentAnswer, rubric, context, competencyDimension } = req.body;
-
-    if (!question || !studentAnswer) {
-      return res.status(400).json({ error: "question and studentAnswer are required" });
-    }
-
-    const ai = getGeminiClient();
-
-    if (ai) {
-      const prompt = `You are a strict, objective, and supportive university STEM lab viva examiner evaluating a student's oral/short-text lab assessment.
-Experiment Context: ${context || "Syllabus Laboratory Experiment"}
-Competency Dimension: ${competencyDimension || "Data Interpretation & Physical Reasoning"}
-
-Viva Question: "${question}"
-Target Rubric & Key Expected Concepts: "${rubric || "Clear understanding of underlying physical principles, correct technical terms, and cause-effect reasoning"}"
-Student's Answer: "${studentAnswer}"
-
-Evaluate the student's answer strictly against the rubric. Respond ONLY in valid JSON with this exact schema:
-{
-  "score": <number between 0 and 100>,
-  "passed": <boolean, true if score >= 70>,
-  "rubricCriterionMet": [<strings of fulfilled concepts>],
-  "missingConcepts": [<strings of missing or misunderstood concepts>],
-  "feedback": "<2-3 sentences of constructive examiner feedback highlighting physical insight and any misconception>",
-  "adaptiveFollowUp": "<one concise follow-up question to probe their reasoning deeper based on what they answered>"
-}`;
-
-      const geminiResult = await callGeminiWithResilience(ai, prompt, {
-        responseMimeType: "application/json",
-        temperature: 0.2,
-      });
-
-      if (geminiResult) {
-        try {
-          const parsed = JSON.parse(geminiResult.text);
-          return res.json({
-            success: true,
-            source: geminiResult.source,
-            ...parsed,
-          });
-        } catch (parseErr) {
-          console.warn("[Viva Evaluation] Could not parse model JSON output, falling back to rubric engine.");
-        }
-      }
-    }
-
-    // Heuristic fallback if API key is not yet set or models experiencing high demand (503)
-    const fallbackEval = getHeuristicVivaEvaluation(studentAnswer, question);
-    return res.json({
-      success: true,
-      source: "rubric-engine",
-      ...fallbackEval,
-    });
-  } catch (error: any) {
-    console.warn("Viva evaluation fallback safely engaged:", error?.message || error);
-    const fallbackEval = getHeuristicVivaEvaluation(req.body?.studentAnswer, req.body?.question);
-    return res.json({
-      success: true,
-      source: "rubric-engine",
-      ...fallbackEval,
-    });
+    const availableClasses = await listAvailableClassesForRegistration();
+    return res.json({ success: true, classes: availableClasses });
+  } catch (error) {
+    return handleServiceError(res, error, "Failed to load available classes.");
   }
 });
 
-// Socratic Hint Engine
-app.post("/api/gemini/hint", async (req: Request, res: Response) => {
-  try {
-    const { experimentName, currentStep, studentIssue, apparatusState } = req.body;
-    const ai = getGeminiClient();
-
-    if (ai) {
-      const prompt = `You are a Socratic lab demonstrator guiding a student in "${experimentName}".
-Current experiment step: "${currentStep}"
-Apparatus state: ${JSON.stringify(apparatusState || {})}
-Student's issue or confusion: "${studentIssue}"
-
-Provide a concise, encouraging Socratic hint (maximum 2 sentences). Do NOT reveal the direct numerical answer. Instead, direct their attention to an instrument reading, scale setting, or fundamental formula so they deduce it themselves.`;
-
-      const geminiResult = await callGeminiWithResilience(ai, prompt, {
-        temperature: 0.3,
-      });
-
-      if (geminiResult) {
-        return res.json({
-          success: true,
-          hint: geminiResult.text,
+// Direct class enrollment mutation endpoint — strictly admin-only (students cannot self-enroll or tamper with enrollments)
+app.post(
+  "/api/enrollments",
+  requireAuth,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      if (req.user!.role !== "admin") {
+        return res.status(403).json({
+          success: false,
+          error: "Only administrators may directly create or modify class enrollment records.",
         });
       }
-    }
-
-    return res.json({
-      success: true,
-      hint: "Check your instrument scale multipliers and ensure all series connections are firmly latched. What does the relationship V = I * R predict when voltage increases?",
-    });
-  } catch (error: any) {
-    return res.json({
-      success: true,
-      hint: "Review the instrument range switches and check if the zero-error has been accounted for.",
-    });
-  }
-});
-
-// Context-Aware Interactive Lab Mentor Chat
-app.post("/api/gemini/mentor-chat", async (req: Request, res: Response) => {
-  try {
-    const {
-      experimentId,
-      experimentTitle,
-      subject,
-      syllabusTag,
-      apparatusList,
-      keyFormulas,
-      currentStep,
-      apparatusState,
-      messages = [],
-      question,
-    } = req.body;
-
-    if (!question || typeof question !== "string") {
-      return res.status(400).json({ error: "question is required" });
-    }
-
-    const ai = getGeminiClient();
-    let reply: string | null = null;
-    let source: string = "expert-rule-engine";
-
-    if (ai) {
-      const systemInstruction = `You are "Lab Mentor", an encouraging, pedagogically sharp, and supportive STEM laboratory instructor assisting a student who is actively conducting a virtual experiment in their lab session.
-
-ACTIVE LAB CONTEXT:
-- Experiment Title: ${experimentTitle || "Syllabus Virtual Lab"}
-- Subject / Unit: ${subject || "Physics / Chemistry / Engineering"} (${syllabusTag || "STEM Syllabus"})
-- Apparatus Available: ${Array.isArray(apparatusList) ? apparatusList.join(", ") : "Standard lab apparatus"}
-- Core Governing Formulas: ${
-        Array.isArray(keyFormulas)
-          ? keyFormulas.map((f: any) => `${f.label}: ${f.formula}`).join(" | ")
-          : "Standard fundamental equations"
+      const { studentId, classId, classCode } = req.body || {};
+      const selector = typeof classId === "string" && classId.trim() ? classId.trim() : classCode;
+      if (!studentId || typeof studentId !== "string" || !selector) {
+        return res.status(400).json({
+          success: false,
+          error: "studentId and classId (or classCode) are required.",
+        });
       }
-- Current Active Step / Milestone: ${currentStep || "Procedure Execution & Data Collection"}
-${apparatusState ? `- Current Instrument / Apparatus State: ${JSON.stringify(apparatusState)}` : ""}
-
-INSTRUCTIONAL RULES:
-1. When students get stuck on specific experimental steps (e.g. circuit connections, meter zero-reading, burette titration endpoint detection, stopping potential calibration, or graph slope calculation), provide clear, actionable diagnostic steps.
-2. Explain the physical/chemical *mechanism* behind their issue concisely.
-3. Encourage scientific reasoning: use Socratic questioning where appropriate, pointing them towards relevant dials, meters, or equations.
-4. Keep answers readable and scannable: use short paragraphs, bullet points for sequential steps, and bold key terms. Avoid overwhelming walls of text. Keep length within 2-4 focused paragraphs.
-5. If they ask about safety, burnout, or experimental errors, explain practical precautions (e.g. open circuits, parallax error, heating effects, over-titration).`;
-
-      // Build recent conversation transcript for context
-      const conversationHistory = messages
-        .slice(-6)
-        .map((m: { role: string; content: string }) => `${m.role === "user" ? "Student" : "Lab Mentor"}: ${m.content}`)
-        .join("\n\n");
-
-      const prompt = `${systemInstruction}
-
-CONVERSATION HISTORY:
-${conversationHistory ? conversationHistory : "(New conversation)"}
-
-Student's Latest Question / Problem:
-"${question}"
-
-Provide your contextual Lab Mentor guidance:`;
-
-      const geminiResult = await callGeminiWithResilience(ai, prompt, {
-        temperature: 0.35,
-      });
-
-      if (geminiResult) {
-        reply = geminiResult.text;
-        source = geminiResult.source;
-      }
-    }
-
-    // If Gemini was unavailable, offline, or transient capacity spikes (503 / 429) were hit on both models,
-    // seamlessly use our high-fidelity pedagogical rule engine
-    if (!reply) {
-      reply = getHeuristicMentorReply(experimentId, question);
-      source = "expert-rule-engine";
-    }
-
-    return res.json({
-      success: true,
-      source,
-      reply,
-    });
-  } catch (error: any) {
-    console.warn("Mentor chat fallback safely engaged:", error?.message || error);
-    const fallbackReply = getHeuristicMentorReply(req.body?.experimentId, req.body?.question || "");
-    return res.json({
-      success: true,
-      source: "expert-rule-engine",
-      reply: fallbackReply,
-    });
-  }
-});
-
-// Submissions CRUD for teacher and student tracking
-app.get(
-  "/api/submissions",
-  requireAuth,
-  requireRole("admin"),
-  async (req: AuthenticatedRequest, res: Response) => {
-    let client;
-
-    try {
-      client = await authService.getClient();
-
-      const result = await client.query(
-        `SELECT
-          id,
-          assignment_id AS "assignmentId",
-          student_id AS "studentId",
-          student_name AS "studentName",
-          experiment_id AS "experimentId",
-          submitted_at AS "submittedAt",
-          attempt_number AS "attemptNumber",
-          total_score AS "totalScore",
-          max_score AS "maxScore",
-          competency_scores AS "competencyScores",
-          task_responses AS "taskResponses",
-          data_readings_count AS "dataReadingsCount",
-          instructor_feedback AS "instructorFeedback"
-        FROM submissions
-        ORDER BY submitted_at DESC`
+      const enrollment = await enrollExistingStudentByAdmin(
+        { id: req.user!.id, role: req.user!.role },
+        { studentId: studentId.trim(), classIdOrCode: selector }
       );
-
-      return res.json({
-        success: true,
-        submissions: result.rows,
-      });
+      return res.status(201).json({ success: true, enrollment });
     } catch (error) {
-      console.error("Failed to fetch submissions:", error);
-
-      return res.status(500).json({
-        success: false,
-        error: "Failed to fetch submissions.",
-      });
-    } finally {
-      client?.release();
+      return handleServiceError(res, error, "Failed to enroll student into class.");
     }
   }
 );
 
+// ==============================================================================
+// AI VIVA PERSISTENCE & EVALUATION ENDPOINTS (Authenticated + PostgreSQL Backed)
+// ==============================================================================
 
+// Start a new AI Viva assessment session (Student)
+app.post(
+  "/api/viva/sessions",
+  requireAuth,
+  requireRole("student"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { experimentId, assignmentId } = req.body || {};
+      if (!experimentId || typeof experimentId !== "string") {
+        return res.status(400).json({ success: false, error: "experimentId is required." });
+      }
+      const data = await startVivaSession(req.user!.id, {
+        experimentId,
+        assignmentId: typeof assignmentId === "string" ? assignmentId : null,
+      });
+      return res.status(201).json({ success: true, ...data });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to start AI Viva session.");
+    }
+  }
+);
+
+// Submit and evaluate an answer inside a persisted AI Viva session (Student)
+app.post(
+  "/api/viva/sessions/:sessionId/answer",
+  requireAuth,
+  requireRole("student"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { sessionId } = req.params;
+      const { taskId, questionIndex, questionText, isAdaptiveFollowUp, studentAnswer } =
+        req.body || {};
+      if (!studentAnswer || typeof studentAnswer !== "string") {
+        return res.status(400).json({ success: false, error: "studentAnswer is required." });
+      }
+      const result = await submitVivaAnswer(req.user!.id, sessionId, {
+        taskId: typeof taskId === "string" ? taskId : undefined,
+        questionIndex: typeof questionIndex === "number" ? questionIndex : undefined,
+        questionText: typeof questionText === "string" ? questionText : undefined,
+        isAdaptiveFollowUp: Boolean(isAdaptiveFollowUp),
+        studentAnswer,
+      });
+
+      let competencyReport = null;
+      if (result.session.status === "completed") {
+        competencyReport = await syncCompetenciesAfterVivaCompletion({
+          studentId: req.user!.id,
+          vivaSessionId: result.session.id,
+          experimentId: result.session.experimentId,
+          assignmentId: result.session.assignmentId,
+          attemptNumber: result.session.attemptNumber,
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        ...result,
+        competencyReport,
+        // Backward-compatible top-level fields for panel consumption
+        score: result.response.score,
+        passed: result.response.passed,
+        feedback: result.response.aiFeedback,
+        rubricCriterionMet: result.response.rubricCriterionMet,
+        missingConcepts: result.response.missingConcepts,
+        adaptiveFollowUp: result.response.adaptiveFollowUp,
+        difficulty: result.response.difficulty,
+        nextDifficulty: result.nextDifficulty,
+        source: result.response.aiModel,
+      });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to evaluate and save AI Viva answer.");
+    }
+  }
+);
+
+// Finalize / complete an AI Viva session (Student)
+app.post(
+  "/api/viva/sessions/:sessionId/complete",
+  requireAuth,
+  requireRole("student"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const session = await completeVivaSession(req.user!.id, req.params.sessionId);
+      const competencyReport = await syncCompetenciesAfterVivaCompletion({
+        studentId: req.user!.id,
+        vivaSessionId: session.id,
+        experimentId: session.experimentId,
+        assignmentId: session.assignmentId,
+        attemptNumber: session.attemptNumber,
+      });
+      return res.json({ success: true, session, competencyReport });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to finalize AI Viva session.");
+    }
+  }
+);
+
+// List authenticated student's own AI Viva session attempts
+app.get(
+  "/api/viva/sessions",
+  requireAuth,
+  requireRole("student"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const experimentId =
+        typeof req.query.experimentId === "string" ? req.query.experimentId : undefined;
+      const sessionsList = await getStudentVivaSessions(req.user!.id, experimentId);
+      return res.json({ success: true, sessions: sessionsList });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to retrieve AI Viva history.");
+    }
+  }
+);
+
+// Retrieve a single AI Viva session report (Student own / Teacher of class / Admin)
+app.get(
+  "/api/viva/sessions/:sessionId",
+  requireAuth,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const session = await getVivaSessionById(
+        { id: req.user!.id, role: req.user!.role },
+        req.params.sessionId
+      );
+      return res.json({ success: true, session });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to retrieve AI Viva report.");
+    }
+  }
+);
+
+// ==============================================================================
+// AUTHENTICATED GEMINI AI ENDPOINTS (Viva Evaluate, Socratic Hint, Lab Mentor)
+// ==============================================================================
+
+// Legacy-compatible Viva Evaluation route: requires auth, optionally persists to viva_sessions
+app.post(
+  "/api/gemini/viva-evaluate",
+  requireAuth,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const {
+        sessionId,
+        experimentId,
+        assignmentId,
+        taskId,
+        questionIndex,
+        question,
+        studentAnswer,
+        rubric,
+        context,
+        competencyDimension,
+      } = req.body || {};
+
+      if (!studentAnswer || typeof studentAnswer !== "string") {
+        return res.status(400).json({ success: false, error: "studentAnswer is required." });
+      }
+
+      // If student passes experimentId or sessionId, persist into PostgreSQL viva tables!
+      if (req.user!.role === "student" && (sessionId || experimentId)) {
+        let activeSessionId = typeof sessionId === "string" ? sessionId : "";
+        if (!activeSessionId && typeof experimentId === "string" && getExperimentById(experimentId)) {
+          const started = await startVivaSession(req.user!.id, {
+            experimentId,
+            assignmentId: typeof assignmentId === "string" ? assignmentId : null,
+          });
+          activeSessionId = started.session.id;
+        }
+
+        if (activeSessionId) {
+          const persisted = await submitVivaAnswer(req.user!.id, activeSessionId, {
+            taskId: typeof taskId === "string" ? taskId : undefined,
+            questionIndex: typeof questionIndex === "number" ? questionIndex : undefined,
+            questionText: typeof question === "string" ? question : undefined,
+            isAdaptiveFollowUp: Boolean(req.body?.isAdaptiveFollowUp),
+            studentAnswer,
+          });
+
+          return res.json({
+            success: true,
+            source: persisted.response.aiModel,
+            vivaSessionId: persisted.session.id,
+            vivaResponseId: persisted.response.id,
+            score: persisted.response.score,
+            passed: persisted.response.passed,
+            rubricCriterionMet: persisted.response.rubricCriterionMet,
+            missingConcepts: persisted.response.missingConcepts,
+            feedback: persisted.response.aiFeedback,
+            adaptiveFollowUp: persisted.response.adaptiveFollowUp,
+            difficulty: persisted.response.difficulty,
+            nextDifficulty: persisted.nextDifficulty,
+            session: persisted.session,
+          });
+        }
+      }
+
+      // Direct evaluation (e.g. scenario viva question) with server-side Gemini validation
+      if (!question || typeof question !== "string") {
+        return res.status(400).json({ success: false, error: "question is required." });
+      }
+
+      const evaluation = await evaluateVivaWithGemini({
+        experimentContext: String(context || "Syllabus Laboratory Experiment"),
+        competencyDimension: String(competencyDimension || "Data Interpretation & Physical Reasoning"),
+        question,
+        rubric: String(
+          rubric ||
+            "Evaluate scientific accuracy, proper terminology, and quantitative/causal reasoning."
+        ),
+        studentAnswer,
+      });
+
+      return res.json({
+        success: true,
+        source: evaluation.model,
+        ...evaluation,
+      });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to evaluate viva response.");
+    }
+  }
+);
+
+// Socratic Hint Engine (Authenticated)
+app.post(
+  "/api/gemini/hint",
+  requireAuth,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { experimentName, currentStep, studentIssue, apparatusState } = req.body || {};
+      if (!experimentName || !studentIssue) {
+        return res
+          .status(400)
+          .json({ success: false, error: "experimentName and studentIssue are required." });
+      }
+
+      const result = await generateSocraticHintWithGemini({
+        experimentName: String(experimentName),
+        currentStep: String(currentStep || "Procedure Execution"),
+        studentIssue: String(studentIssue),
+        apparatusState,
+      });
+
+      return res.json({
+        success: true,
+        source: result.model,
+        hint: result.hint,
+      });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to generate Socratic hint.");
+    }
+  }
+);
+
+// Context-Aware Lab Mentor Chat (Authenticated)
+app.post(
+  "/api/gemini/mentor-chat",
+  requireAuth,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const {
+        experimentTitle,
+        subject,
+        syllabusTag,
+        apparatusList,
+        keyFormulas,
+        currentStep,
+        apparatusState,
+        messages = [],
+        question,
+      } = req.body || {};
+
+      if (!question || typeof question !== "string" || !question.trim()) {
+        return res.status(400).json({ success: false, error: "question is required." });
+      }
+
+      const result = await generateMentorReplyWithGemini({
+        experimentTitle: String(experimentTitle || "Syllabus Virtual Lab"),
+        subject: String(subject || "STEM"),
+        syllabusTag: String(syllabusTag || "Laboratory Curriculum"),
+        apparatusList: Array.isArray(apparatusList) ? apparatusList.map(String) : [],
+        keyFormulas: Array.isArray(keyFormulas) ? keyFormulas : [],
+        currentStep: String(currentStep || "Experiment Execution"),
+        apparatusState,
+        messages: Array.isArray(messages) ? messages : [],
+        question: question.trim(),
+      });
+
+      return res.json({
+        success: true,
+        source: result.model,
+        reply: result.reply,
+      });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to contact Lab Mentor.");
+    }
+  }
+);
+
+// ==============================================================================
+// SUBMISSIONS WORKFLOW ENDPOINTS (Strict Ownership & Server-Side Grading)
+// ==============================================================================
+
+// Admin: list all submissions across platform
+app.get(
+  "/api/submissions",
+  requireAuth,
+  requireRole("admin"),
+  async (_req: AuthenticatedRequest, res: Response) => {
+    try {
+      const list = await getAllSubmissionsAdmin();
+      return res.json({ success: true, submissions: list });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to fetch submissions.");
+    }
+  }
+);
+
+// Student: submit an experiment attempt (server-derived studentId, server-graded tasks & competencies)
 app.post(
   "/api/submissions",
   requireAuth,
   requireRole("student"),
   async (req: AuthenticatedRequest, res: Response) => {
-    let client;
-
     try {
       const {
         assignmentId,
         experimentId,
-        totalScore,
-        maxScore,
-        competencyScores,
-        vivaResponses,
-      } = req.body;
+        taskAnswers,
+        taskResponses,
+        observations,
+        calculatedResults,
+        dataReadingsCount,
+        vivaSessionId,
+        completionStatus,
+      } = req.body || {};
 
-      if (
-        !assignmentId ||
-        !experimentId ||
-        totalScore == null ||
-        maxScore == null ||
-        !competencyScores ||
-        !Array.isArray(vivaResponses)
-      ) {
-        return res.status(400).json({
-          success: false,
-          error: "Required submission fields are missing.",
-        });
-      }
-
-      if (
-        !Number.isFinite(Number(totalScore)) ||
-        !Number.isFinite(Number(maxScore)) ||
-        Number(totalScore) < 0 ||
-        Number(maxScore) <= 0 ||
-        Number(totalScore) > Number(maxScore)
-      ) {
-        return res.status(400).json({
-          success: false,
-          error: "Invalid submission score.",
-        });
-      }
-
-      const requiredCompetencies = [
-        "setup_adherence",
-        "measurement_precision",
-        "data_interpretation",
-        "troubleshooting_safety",
-        "experimental_design",
-      ];
-
-      for (const key of requiredCompetencies) {
-        if (
-          !Number.isFinite(Number(competencyScores[key])) ||
-          Number(competencyScores[key]) < 0 ||
-          Number(competencyScores[key]) > 100
-        ) {
-          return res.status(400).json({
-            success: false,
-            error: `Invalid competency score: ${key}`,
-          });
-        }
-      }
-
-      client = await authService.getClient();
-
-      const assignmentResult = await client.query(
-        `SELECT a.id, a.experiment_id, a.attempts_allowed
-         FROM assignments a
-         JOIN class_students cs ON cs.class_id = a.class_id
-         WHERE a.id = $1
-           AND cs.student_id = $2
-           AND a.status = 'active'`,
-        [assignmentId, req.user!.id]
-      );
-
-      if (assignmentResult.rowCount === 0) {
-        return res.status(403).json({
-          success: false,
-          error: "Assignment not found or not assigned to this student.",
-        });
-      }
-
-      const assignment = assignmentResult.rows[0];
-
-      if (assignment.experiment_id !== experimentId) {
-        return res.status(400).json({
-          success: false,
-          error: "Experiment does not match the assignment.",
-        });
-      }
-
-      const attemptResult = await client.query(
-        `SELECT COUNT(*)::int AS count
-         FROM submissions
-         WHERE assignment_id = $1 AND student_id = $2`,
-        [assignmentId, req.user!.id]
-      );
-
-      const attemptNumber = attemptResult.rows[0].count + 1;
-
-      if (attemptNumber > assignment.attempts_allowed) {
-        return res.status(409).json({
-          success: false,
-          error: "You have used all allowed attempts for this assignment.",
-        });
-      }
-
-      const id = `sub-${Date.now()}-${Math.random()
-        .toString(36)
-        .slice(2, 8)}`;
-
-      const result = await client.query(
-        `INSERT INTO submissions (
-          id,
-          assignment_id,
-          student_id,
-          student_name,
-          experiment_id,
-          submitted_at,
-          attempt_number,
-          total_score,
-          max_score,
-          competency_scores,
-          task_responses,
-          data_readings_count
-        )
-        VALUES ($1,$2,$3,$4,$5,NOW(),$6,$7,$8,$9::jsonb,$10::jsonb,$11)
-        RETURNING
-          id,
-          assignment_id AS "assignmentId",
-          student_id AS "studentId",
-          student_name AS "studentName",
-          experiment_id AS "experimentId",
-          submitted_at AS "submittedAt",
-          attempt_number AS "attemptNumber",
-          total_score AS "totalScore",
-          max_score AS "maxScore",
-          competency_scores AS "competencyScores",
-          task_responses AS "taskResponses",
-          data_readings_count AS "dataReadingsCount"`,
-        [
-          id,
+      const result = await createStudentSubmission(
+        { id: req.user!.id, name: req.user!.name },
+        {
           assignmentId,
-          req.user!.id,
-          req.user!.name,
           experimentId,
-          attemptNumber,
-          Number(totalScore),
-          Number(maxScore),
-          JSON.stringify(competencyScores),
-          JSON.stringify({ vivaResponses }),
-          0,
-        ]
+          taskAnswers,
+          taskResponses,
+          observations,
+          calculatedResults,
+          dataReadingsCount,
+          vivaSessionId,
+          completionStatus,
+        }
       );
 
       return res.status(201).json({
         success: true,
-        submission: result.rows[0],
+        submission: result.submission,
+        competencyReport: result.competencyReport,
       });
     } catch (error) {
-      console.error("Failed to save submission:", error);
-
-      return res.status(500).json({
-        success: false,
-        error: "Failed to save submission.",
-      });
-    } finally {
-      client?.release();
+      return handleServiceError(res, error, "Failed to save experiment submission.");
     }
   }
 );
 
+// Submission detail endpoint with strict RBAC + ownership verification
+app.get(
+  "/api/submissions/:id",
+  requireAuth,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const submission = await getSubmissionById(
+        { id: req.user!.id, role: req.user!.role },
+        req.params.id
+      );
+      return res.json({ success: true, submission });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to retrieve submission details.");
+    }
+  }
+);
 
 // ==============================================================================
-// ROLE-SCOPED SECURE ENDPOINTS (Requirements 4, 28, 29, 30)
+// 1. STUDENT-SCOPED ENDPOINTS (/api/student/*)
 // ==============================================================================
 
-// 1. Student Scoped Endpoints (/api/student/*)
-app.get("/api/student/experiments", requireAuth, requireRole("student"), (req: AuthenticatedRequest, res: Response) => {
-  res.json({
-    success: true,
-    studentId: req.user!.id,
-    experiments: [
-      { id: "millikan-oil-drop", title: "Millikan's Oil Drop Experiment", status: "assigned", dueDate: "2026-10-15" },
-      { id: "photoelectric-effect", title: "Photoelectric Effect Lab", status: "in-progress", dueDate: "2026-10-20" },
-      { id: "franck-hertz", title: "Franck-Hertz Experiment", status: "completed", dueDate: "2026-09-30" },
-    ],
-  });
-});
+app.get(
+  "/api/student/experiments",
+  requireAuth,
+  requireRole("student"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const experiments = await getStudentExperimentsStatus(req.user!.id);
+      return res.json({
+        success: true,
+        studentId: req.user!.id,
+        experiments,
+      });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to fetch student experiments.");
+    }
+  }
+);
 
-// IDOR Guard: Returns ONLY the authenticated student's own submissions
-
-// GET assignments for the authenticated student
 app.get(
   "/api/student/assignments",
   requireAuth,
   requireRole("student"),
   async (req: AuthenticatedRequest, res: Response) => {
-    let client;
-
     try {
-      client = await authService.getClient();
+      const filterClassId =
+        typeof req.query.classId === "string" && req.query.classId.trim()
+          ? req.query.classId.trim()
+          : undefined;
 
-      const result = await client.query(
-        `SELECT
-           a.id,
-           a.class_id AS "classId",
-           a.title,
-           a.experiment_id AS "experimentId",
-           a.due_date AS "dueDate",
-           a.total_marks AS "totalMarks",
-           a.weight_towards_internal AS "weightTowardsInternal",
-           a.attempts_allowed AS "attemptsAllowed",
-           a.allow_free_exploration AS "allowFreeExploration",
-           a.status,
-           COUNT(s.id)::int AS "attemptsUsed"
-         FROM assignments a
-         JOIN class_students cs
-           ON cs.class_id = a.class_id
-         LEFT JOIN submissions s
-           ON s.assignment_id = a.id
-           AND s.student_id = cs.student_id
-         WHERE cs.student_id = $1
-           AND a.status = 'active'
-         GROUP BY a.id
-         ORDER BY a.due_date ASC`,
-        [req.user!.id]
-      );
+      // If student passes a classId query parameter, explicitly verify they are enrolled in that class
+      if (filterClassId) {
+        const membership = await db
+          .select({ id: classEnrollments.id })
+          .from(classEnrollments)
+          .where(
+            and(
+              eq(classEnrollments.studentId, req.user!.id),
+              eq(classEnrollments.classId, filterClassId),
+              eq(classEnrollments.enrollmentStatus, "active")
+            )
+          )
+          .limit(1);
+        if (membership.length === 0) {
+          return res.status(403).json({
+            success: false,
+            error: "You are not enrolled in the requested class.",
+          });
+        }
+      }
+
+      const whereConditions = [
+        eq(classEnrollments.studentId, req.user!.id),
+        eq(classEnrollments.enrollmentStatus, "active"),
+        eq(assignments.status, "active"),
+      ];
+      if (filterClassId) {
+        whereConditions.push(eq(assignments.classId, filterClassId));
+      }
+
+      const rows = await db
+        .select({
+          id: assignments.id,
+          classId: assignments.classId,
+          classCode: classes.code,
+          className: classes.name,
+          title: assignments.title,
+          experimentId: assignments.experimentId,
+          dueDate: assignments.dueDate,
+          totalMarks: assignments.totalMarks,
+          weightTowardsInternal: assignments.weightTowardsInternal,
+          attemptsAllowed: assignments.attemptsAllowed,
+          allowFreeExploration: assignments.allowFreeExploration,
+          evaluationCriteria: assignments.evaluationCriteria,
+          status: assignments.status,
+          attemptsUsed: sql<number>`count(${submissions.id})::int`,
+        })
+        .from(assignments)
+        .innerJoin(classes, eq(classes.id, assignments.classId))
+        .innerJoin(classEnrollments, eq(classEnrollments.classId, assignments.classId))
+        .leftJoin(
+          submissions,
+          and(
+            eq(submissions.assignmentId, assignments.id),
+            eq(submissions.studentId, classEnrollments.studentId)
+          )
+        )
+        .where(and(...whereConditions))
+        .groupBy(assignments.id, classes.code, classes.name)
+        .orderBy(assignments.dueDate);
 
       return res.json({
         success: true,
         studentId: req.user!.id,
-        assignments: result.rows,
+        assignments: rows.map((r) => ({
+          ...r,
+          dueDate: r.dueDate.toISOString(),
+          totalMarks: Number(r.totalMarks),
+          weightTowardsInternal: Number(r.weightTowardsInternal),
+          completedCount: r.attemptsUsed,
+          totalStudents: 1,
+        })),
       });
     } catch (error) {
-      console.error("Failed to fetch student assignments:", error);
-
-      return res.status(500).json({
-        success: false,
-        error: "Failed to fetch student assignments.",
-      });
-    } finally {
-      client?.release();
+      return handleServiceError(res, error, "Failed to fetch student assignments.");
     }
   }
 );
-
 
 app.get(
   "/api/student/submissions",
   requireAuth,
   requireRole("student"),
   async (req: AuthenticatedRequest, res: Response) => {
-    let client;
-
     try {
-      client = await authService.getClient();
-
-      const result = await client.query(
-        `SELECT
-           id,
-           assignment_id AS "assignmentId",
-           student_id AS "studentId",
-           student_name AS "studentName",
-           experiment_id AS "experimentId",
-           submitted_at AS "submittedAt",
-           attempt_number AS "attemptNumber",
-           total_score AS "totalScore",
-           max_score AS "maxScore",
-           competency_scores AS "competencyScores",
-           task_responses AS "taskResponses",
-           data_readings_count AS "dataReadingsCount",
-           instructor_feedback AS "instructorFeedback"
-         FROM submissions
-         WHERE student_id = $1
-         ORDER BY submitted_at DESC`,
-        [req.user!.id]
-      );
-
-      return res.json({
-        success: true,
-        submissions: result.rows,
-      });
+      const list = await getStudentSubmissionsList(req.user!.id);
+      return res.json({ success: true, submissions: list });
     } catch (error) {
-      console.error("Failed to fetch student submissions:", error);
-
-      return res.status(500).json({
-        success: false,
-        error: "Failed to fetch student submissions.",
-      });
-    } finally {
-      client?.release();
+      return handleServiceError(res, error, "Failed to fetch student submissions.");
     }
-    
   }
 );
 
-
-
-
+app.get(
+  "/api/student/submissions/history",
+  requireAuth,
+  requireRole("student"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const experimentId =
+        typeof req.query.experimentId === "string" ? req.query.experimentId : undefined;
+      const list = await getStudentSubmissionsList(req.user!.id);
+      const filtered = experimentId
+        ? list.filter((s) => s.experimentId === experimentId)
+        : list;
+      return res.json({ success: true, history: filtered });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to fetch submission history.");
+    }
+  }
+);
 
 app.get(
   "/api/student/classes",
   requireAuth,
   requireRole("student"),
   async (req: AuthenticatedRequest, res: Response) => {
-    let client;
-
     try {
-      client = await authService.getClient();
-
-      const result = await client.query(
-        `SELECT
-           c.id,
-           c.name,
-           c.code,
-           c.department,
-           c.semester,
-           c.academic_year AS "academicYear",
-           0 AS "studentCount",
-           c.average_competencies AS "averageCompetencies",
-           c.common_misconceptions AS "commonMisconceptions"
-         FROM classes c
-         JOIN class_students cs ON cs.class_id = c.id
-         WHERE cs.student_id = $1
-         ORDER BY c.name`,
-        [req.user!.id]
-      );
+      const enrolled = await db
+        .select({
+          id: classes.id,
+          name: classes.name,
+          code: classes.code,
+          department: classes.department,
+          semester: classes.semester,
+          academicYear: classes.academicYear,
+          averageCompetencies: classes.averageCompetencies,
+          commonMisconceptions: classes.commonMisconceptions,
+          enrollmentId: classEnrollments.id,
+          enrollmentStatus: classEnrollments.enrollmentStatus,
+          enrolledAt: classEnrollments.enrolledAt,
+          facultyId: classes.teacherId,
+          facultyName: users.name,
+          facultyEmail: users.email,
+          studentCount: sql<number>`(SELECT COUNT(*)::int FROM class_enrollments ce2 WHERE ce2.class_id = "classes"."id" AND ce2.enrollment_status = 'active')`,
+          assignmentCount: sql<number>`(SELECT COUNT(*)::int FROM assignments a2 WHERE a2.class_id = "classes"."id" AND a2.status = 'active')`,
+        })
+        .from(classes)
+        .innerJoin(classEnrollments, eq(classEnrollments.classId, classes.id))
+        .leftJoin(users, eq(users.id, classes.teacherId))
+        .where(
+          and(
+            eq(classEnrollments.studentId, req.user!.id),
+            eq(classEnrollments.enrollmentStatus, "active")
+          )
+        )
+        .orderBy(classes.code, classes.name);
 
       return res.json({
         success: true,
-        classes: result.rows,
+        classes: enrolled.map((c) => ({
+          ...c,
+          enrolledAt: c.enrolledAt.toISOString(),
+          studentCount: Number(c.studentCount) || 0,
+          assignmentCount: Number(c.assignmentCount) || 0,
+        })),
       });
     } catch (error) {
-      console.error("Failed to fetch student classes:", error);
-
-      return res.status(500).json({
-        success: false,
-        error: "Failed to fetch student classes.",
-      });
-    } finally {
-      client?.release();
+      return handleServiceError(res, error, "Failed to fetch student classes.");
     }
   }
 );
 
-
-
-
-app.get("/api/student/profile", requireAuth, requireRole("student"), (req: AuthenticatedRequest, res: Response) => {
-  res.json({
-    success: true,
-    profile: {
-      id: req.user!.id,
-      name: req.user!.name,
-      email: req.user!.email,
-      role: req.user!.role,
-      institution: req.user!.institution,
-      enrollmentCode: req.user!.enrollment_code,
-      competencies: {
-        setup_adherence: 92,
-        measurement_precision: 88,
-        data_interpretation: 90,
-        troubleshooting_safety: 95,
-        experimental_design: 87,
-      },
-    },
-  });
-});
-
 app.get(
-  "/api/student/competencies",
+  "/api/student/classes/:classId",
   requireAuth,
   requireRole("student"),
-  async (req: AuthenticatedRequest, res) => {
+  async (req: AuthenticatedRequest, res: Response) => {
     try {
-      const client = await authService.getClient();
+      const rows = await db
+        .select({
+          id: classes.id,
+          name: classes.name,
+          code: classes.code,
+          department: classes.department,
+          semester: classes.semester,
+          academicYear: classes.academicYear,
+          enrollmentId: classEnrollments.id,
+          enrollmentStatus: classEnrollments.enrollmentStatus,
+          enrolledAt: classEnrollments.enrolledAt,
+          facultyName: users.name,
+          facultyEmail: users.email,
+          studentCount: sql<number>`(SELECT COUNT(*)::int FROM class_enrollments ce2 WHERE ce2.class_id = "classes"."id" AND ce2.enrollment_status = 'active')`,
+        })
+        .from(classes)
+        .innerJoin(classEnrollments, eq(classEnrollments.classId, classes.id))
+        .leftJoin(users, eq(users.id, classes.teacherId))
+        .where(
+          and(
+            eq(classes.id, req.params.classId),
+            eq(classEnrollments.studentId, req.user!.id),
+            eq(classEnrollments.enrollmentStatus, "active")
+          )
+        )
+        .limit(1);
 
-      const result = await client.query(
-        `
-        SELECT competency_scores AS "competencyScores"
-        FROM submissions
-        WHERE student_id = $1
-          AND competency_scores IS NOT NULL
-        ORDER BY submitted_at DESC NULLS LAST, created_at DESC
-        LIMIT 1
-        `,
-        [req.user!.id]
-      );
-
-      if (result.rows.length === 0) {
-        return res.json({
-          success: true,
-          competencyScores: null,
+      if (rows.length === 0) {
+        return res.status(403).json({
+          success: false,
+          error: "Access denied. You are not enrolled in this class.",
         });
       }
 
       return res.json({
         success: true,
-        competencyScores: result.rows[0].competencyScores,
+        class: {
+          ...rows[0],
+          enrolledAt: rows[0].enrolledAt.toISOString(),
+          studentCount: Number(rows[0].studentCount) || 0,
+        },
       });
     } catch (error) {
-      console.error("Failed to fetch competency scores:", error);
-
-      return res.status(500).json({
-        success: false,
-        message: "Failed to fetch competency scores",
-      });
+      return handleServiceError(res, error, "Failed to load class details.");
     }
   }
 );
 
-// 2. Teacher Scoped Endpoints (/api/teacher/*)
+app.get(
+  "/api/student/profile",
+  requireAuth,
+  requireRole("student"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const competencyReport = await getStudentCompetencyReport(req.user!.id);
+      return res.json({
+        success: true,
+        profile: {
+          id: req.user!.id,
+          name: req.user!.name,
+          email: req.user!.email,
+          role: req.user!.role,
+          institution: req.user!.institution,
+          enrollmentCode: req.user!.enrollment_code,
+          competencies: competencyReport.competencyScores,
+          overallScore: competencyReport.overallScore,
+          strongAreas: competencyReport.strongAreas,
+          weakAreas: competencyReport.weakAreas,
+        },
+      });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to fetch student profile.");
+    }
+  }
+);
+
+app.get(
+  "/api/student/competencies",
+  requireAuth,
+  requireRole("student"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const report = await getStudentCompetencyReport(req.user!.id);
+      return res.json({
+        success: true,
+        competencyScores: report.competencyScores,
+        report,
+      });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to fetch competency scores.");
+    }
+  }
+);
+
+app.get(
+  "/api/student/recommendations",
+  requireAuth,
+  requireRole("student"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const recommendations = await getStudentRecommendations(req.user!.id);
+      return res.json({
+        success: true,
+        studentId: req.user!.id,
+        recommendations,
+      });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to load personalized recommendations.");
+    }
+  }
+);
+
+app.get(
+  "/api/student/notifications",
+  requireAuth,
+  requireRole("student"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const data = await getStudentNotifications(req.user!.id);
+      return res.json({
+        success: true,
+        studentId: req.user!.id,
+        ...data,
+      });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to load student notifications.");
+    }
+  }
+);
+
+app.patch(
+  "/api/student/notifications/:key/read",
+  requireAuth,
+  requireRole("student"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const key = decodeURIComponent(req.params.key || "");
+      await markNotificationRead(req.user!.id, key);
+      return res.json({ success: true, notificationKey: key });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to mark notification as read.");
+    }
+  }
+);
+
+app.post(
+  "/api/student/notifications/read-all",
+  requireAuth,
+  requireRole("student"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const count = await markAllNotificationsRead(req.user!.id);
+      return res.json({ success: true, markedCount: count });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to mark notifications as read.");
+    }
+  }
+);
+
+// ==============================================================================
+// 2. TEACHER / FACULTY-SCOPED ENDPOINTS (/api/teacher/*)
+// ==============================================================================
 
 app.get(
   "/api/teacher/classes",
   requireAuth,
   requireRole("teacher"),
   async (req: AuthenticatedRequest, res: Response) => {
-    let client;
-
     try {
-      client = await authService.getClient();
+      const rows = await db
+        .select({
+          id: classes.id,
+          name: classes.name,
+          code: classes.code,
+          department: classes.department,
+          semester: classes.semester,
+          academicYear: classes.academicYear,
+          averageCompetencies: classes.averageCompetencies,
+          commonMisconceptions: classes.commonMisconceptions,
+          studentCount: sql<number>`(SELECT COUNT(*)::int FROM class_enrollments ce WHERE ce.class_id = "classes"."id" AND ce.enrollment_status = 'active')`,
+        })
+        .from(classes)
+        .where(eq(classes.teacherId, req.user!.id))
+        .orderBy(classes.code, classes.name);
 
-      const result = await client.query(
-        `SELECT
-           c.id,
-           c.name,
-           c.code,
-           c.department,
-           c.semester,
-           c.academic_year AS "academicYear",
-           COUNT(cs.student_id)::int AS "studentCount",
-           c.average_competencies AS "averageCompetencies",
-           c.common_misconceptions AS "commonMisconceptions"
-         FROM classes c
-         LEFT JOIN class_students cs ON cs.class_id = c.id
-         WHERE c.teacher_id = $1
-         GROUP BY c.id
-         ORDER BY c.name`,
-        [req.user!.id]
-      );
-
-      res.json({
+      return res.json({
         success: true,
-        teacherId: req.user!.id,
-        classes: result.rows,
+        classes: rows.map((r) => ({ ...r, studentCount: Number(r.studentCount) || 0 })),
       });
     } catch (error) {
-      console.error("Failed to fetch teacher classes:", error);
+      return handleServiceError(res, error, "Failed to fetch teacher classes.");
+    }
+  }
+);
 
-      res.status(500).json({
-        success: false,
-        error: "Failed to fetch classes.",
+app.get(
+  "/api/teacher/classes/:classId/students",
+  requireAuth,
+  requireRole("teacher"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const students = await getTeacherClassStudents(req.user!.id, req.params.classId);
+      return res.json({ success: true, students });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to fetch enrolled students.");
+    }
+  }
+);
+
+// Faculty persistent notifications (strictly scoped to authenticated faculty member)
+app.get(
+  "/api/teacher/notifications",
+  requireAuth,
+  requireRole("teacher"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const unreadOnly = req.query.unreadOnly === "true";
+      const limit = req.query.limit ? Number(req.query.limit) : 50;
+      const data = await getPersistentNotificationsForUser(req.user!.id, {
+        limit,
+        unreadOnly,
       });
-    } finally {
-      client?.release();
+      return res.json({
+        success: true,
+        teacherId: req.user!.id,
+        ...data,
+      });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to load faculty notifications.");
+    }
+  }
+);
+
+app.patch(
+  "/api/teacher/notifications/:id/read",
+  requireAuth,
+  requireRole("teacher"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const updated = await markPersistentNotificationRead(req.user!.id, req.params.id);
+      return res.json({ success: true, notification: updated });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to mark faculty notification as read.");
+    }
+  }
+);
+
+app.post(
+  "/api/teacher/notifications/read-all",
+  requireAuth,
+  requireRole("teacher"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const markedCount = await markAllPersistentNotificationsRead(req.user!.id);
+      return res.json({ success: true, markedCount });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to mark faculty notifications as read.");
+    }
+  }
+);
+
+app.get(
+  "/api/teacher/assignments",
+  requireAuth,
+  requireRole("teacher"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const rows = await db
+        .select({
+          id: assignments.id,
+          classId: assignments.classId,
+          title: assignments.title,
+          experimentId: assignments.experimentId,
+          dueDate: assignments.dueDate,
+          totalMarks: assignments.totalMarks,
+          weightTowardsInternal: assignments.weightTowardsInternal,
+          attemptsAllowed: assignments.attemptsAllowed,
+          allowFreeExploration: assignments.allowFreeExploration,
+          evaluationCriteria: assignments.evaluationCriteria,
+          status: assignments.status,
+          completedCount: sql<number>`count(distinct ${submissions.studentId})::int`,
+          totalStudents: sql<number>`(SELECT COUNT(*)::int FROM class_enrollments ce WHERE ce.class_id = "assignments"."class_id" AND ce.enrollment_status = 'active')`,
+          avgScore: sql<number>`coalesce(round(avg((coalesce(${submissions.facultyScore}, ${submissions.totalScore}) / nullif(${submissions.maxScore}, 0)) * 100)::numeric, 1), 0)::float`,
+        })
+        .from(assignments)
+        .innerJoin(classes, eq(classes.id, assignments.classId))
+        .leftJoin(submissions, eq(submissions.assignmentId, assignments.id))
+        .where(eq(classes.teacherId, req.user!.id))
+        .groupBy(assignments.id)
+        .orderBy(desc(assignments.createdAt));
+
+      return res.json({
+        success: true,
+        assignments: rows.map((r) => ({
+          ...r,
+          dueDate: r.dueDate.toISOString(),
+          totalMarks: Number(r.totalMarks),
+          weightTowardsInternal: Number(r.weightTowardsInternal),
+          avgScore: Number(r.avgScore) || 0,
+        })),
+      });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to fetch assignments.");
     }
   }
 );
@@ -1132,8 +1073,6 @@ app.post(
   requireAuth,
   requireRole("teacher"),
   async (req: AuthenticatedRequest, res: Response) => {
-    let client;
-
     try {
       const {
         classId,
@@ -1144,264 +1083,567 @@ app.post(
         weightTowardsInternal,
         attemptsAllowed,
         allowFreeExploration,
-      } = req.body;
+        evaluationCriteria,
+      } = req.body || {};
 
-      if (!classId || !title?.trim() || !experimentId || !dueDate) {
+      if (!classId || !title || !experimentId || !dueDate) {
         return res.status(400).json({
           success: false,
           error: "classId, title, experimentId, and dueDate are required.",
         });
       }
 
-      client = await authService.getClient();
-
-      // Confirm the class belongs to the logged-in teacher.
-      const classResult = await client.query(
-        `SELECT id FROM classes
-         WHERE id = $1 AND teacher_id = $2`,
-        [classId, req.user!.id]
-      );
-
-      if (classResult.rowCount === 0) {
-        return res.status(403).json({
+      if (!getExperimentById(experimentId)) {
+        return res.status(400).json({
           success: false,
-          error: "Class not found or not assigned to this teacher.",
+          error: "Unknown experimentId selected.",
         });
       }
 
-      const id = `asg-${Date.now()}`;
+      const parsedDue = new Date(dueDate);
+      if (Number.isNaN(parsedDue.getTime())) {
+        return res.status(400).json({ success: false, error: "Invalid dueDate format." });
+      }
 
-      const result = await client.query(
-        `INSERT INTO assignments (
-          id,
-          class_id,
-          title,
-          experiment_id,
-          due_date,
-          total_marks,
-          weight_towards_internal,
-          attempts_allowed,
-          allow_free_exploration,
-          status,
-          created_by
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'active', $10)
-        RETURNING
-          id,
-          class_id AS "classId",
-          title,
-          experiment_id AS "experimentId",
-          due_date AS "dueDate",
-          total_marks AS "totalMarks",
-          weight_towards_internal AS "weightTowardsInternal",
-          attempts_allowed AS "attemptsAllowed",
-          allow_free_exploration AS "allowFreeExploration",
-          status`,
-        [
+      const marks = Number(totalMarks ?? 100);
+      const weight = Number(weightTowardsInternal ?? 10);
+      const attempts = Number(attemptsAllowed ?? 1);
+      if (!Number.isFinite(marks) || marks <= 0) {
+        return res.status(400).json({ success: false, error: "totalMarks must be positive." });
+      }
+      if (!Number.isFinite(weight) || weight < 0 || weight > 100) {
+        return res
+          .status(400)
+          .json({ success: false, error: "weightTowardsInternal must be between 0 and 100." });
+      }
+      if (!Number.isInteger(attempts) || attempts < 1) {
+        return res.status(400).json({ success: false, error: "attemptsAllowed must be >= 1." });
+      }
+
+      // Validate and sanitize optional evaluationCriteria
+      const rawCriteria =
+        evaluationCriteria && typeof evaluationCriteria === "object"
+          ? evaluationCriteria
+          : {};
+      const practicalWeightPct = Math.max(
+        0,
+        Math.min(100, Math.round(Number(rawCriteria.practicalWeightPct ?? 70)))
+      );
+      const vivaWeightPct = Math.max(
+        0,
+        Math.min(100, Math.round(Number(rawCriteria.vivaWeightPct ?? 100 - practicalWeightPct)))
+      );
+      if (practicalWeightPct + vivaWeightPct !== 100) {
+        return res.status(400).json({
+          success: false,
+          error: "Practical weight and AI Viva weight must sum to 100%.",
+        });
+      }
+      const passingThresholdPct = Math.max(
+        30,
+        Math.min(100, Math.round(Number(rawCriteria.passingThresholdPct ?? 70)))
+      );
+      const sanitizedCriteria = {
+        practicalWeightPct,
+        vivaWeightPct,
+        passingThresholdPct,
+        requireViva:
+          rawCriteria.requireViva !== undefined ? Boolean(rawCriteria.requireViva) : true,
+        rubricNotes:
+          typeof rawCriteria.rubricNotes === "string"
+            ? rawCriteria.rubricNotes.trim().slice(0, 600)
+            : "",
+      };
+
+      // Enforce class ownership
+      const owned = await db
+        .select({ id: classes.id })
+        .from(classes)
+        .where(and(eq(classes.id, classId), eq(classes.teacherId, req.user!.id)))
+        .limit(1);
+
+      if (owned.length === 0) {
+        return res.status(403).json({
+          success: false,
+          error: "Class not found or you do not have permission to assign to this class.",
+        });
+      }
+
+      const id = `asg-${crypto.randomUUID().slice(0, 12)}`;
+      const [inserted] = await db
+        .insert(assignments)
+        .values({
           id,
           classId,
-          title.trim(),
+          title: String(title).trim(),
           experimentId,
-          dueDate,
-          totalMarks ?? 100,
-          weightTowardsInternal ?? 0,
-          attemptsAllowed ?? 1,
-          allowFreeExploration ?? false,
-          req.user!.id,
-        ]
-      );
+          dueDate: parsedDue,
+          totalMarks: marks.toFixed(2),
+          weightTowardsInternal: weight.toFixed(2),
+          attemptsAllowed: attempts,
+          allowFreeExploration: Boolean(allowFreeExploration),
+          evaluationCriteria: sanitizedCriteria,
+          status: "active",
+          createdBy: req.user!.id,
+        })
+        .returning();
+
+      const studentCountRes = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(classEnrollments)
+        .where(
+          and(
+            eq(classEnrollments.classId, classId),
+            eq(classEnrollments.enrollmentStatus, "active")
+          )
+        );
 
       return res.status(201).json({
         success: true,
-        assignment: result.rows[0],
+        assignment: {
+          id: inserted.id,
+          classId: inserted.classId,
+          title: inserted.title,
+          experimentId: inserted.experimentId,
+          dueDate: inserted.dueDate.toISOString(),
+          totalMarks: Number(inserted.totalMarks),
+          weightTowardsInternal: Number(inserted.weightTowardsInternal),
+          attemptsAllowed: inserted.attemptsAllowed,
+          allowFreeExploration: inserted.allowFreeExploration,
+          evaluationCriteria: inserted.evaluationCriteria,
+          status: inserted.status,
+          completedCount: 0,
+          totalStudents: studentCountRes[0]?.count ?? 0,
+          avgScore: 0,
+        },
       });
     } catch (error) {
-      console.error("Failed to create assignment:", error);
-
-      return res.status(500).json({
-        success: false,
-        error: "Failed to create assignment.",
-      });
-    } finally {
-      client?.release();
+      return handleServiceError(res, error, "Failed to create assignment.");
     }
   }
 );
 
+app.patch(
+  "/api/teacher/assignments/:id/status",
+  requireAuth,
+  requireRole("teacher"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { status } = req.body || {};
+      if (status !== "active" && status !== "archived") {
+        return res
+          .status(400)
+          .json({ success: false, error: "status must be 'active' or 'archived'." });
+      }
+
+      const owned = await db
+        .select({ id: assignments.id })
+        .from(assignments)
+        .innerJoin(classes, eq(classes.id, assignments.classId))
+        .where(and(eq(assignments.id, req.params.id), eq(classes.teacherId, req.user!.id)))
+        .limit(1);
+
+      if (owned.length === 0) {
+        return res.status(403).json({
+          success: false,
+          error: "Assignment not found or you are not authorized to modify it.",
+        });
+      }
+
+      const [updated] = await db
+        .update(assignments)
+        .set({ status })
+        .where(eq(assignments.id, req.params.id))
+        .returning();
+
+      return res.json({ success: true, assignment: updated });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to update assignment status.");
+    }
+  }
+);
 
 app.get(
   "/api/teacher/submissions",
   requireAuth,
   requireRole("teacher"),
   async (req: AuthenticatedRequest, res: Response) => {
-    let client;
-
     try {
-      client = await authService.getClient();
-
-      const result = await client.query(
-        `SELECT
-          s.id,
-          s.assignment_id AS "assignmentId",
-          s.student_id AS "studentId",
-          s.student_name AS "studentName",
-          s.experiment_id AS "experimentId",
-          s.submitted_at AS "submittedAt",
-          s.attempt_number AS "attemptNumber",
-          s.total_score AS "totalScore",
-          s.max_score AS "maxScore",
-          s.competency_scores AS "competencyScores",
-          s.task_responses AS "taskResponses",
-          s.data_readings_count AS "dataReadingsCount",
-          s.instructor_feedback AS "instructorFeedback"
-        FROM submissions s
-        JOIN assignments a ON a.id = s.assignment_id
-        JOIN classes c ON c.id = a.class_id
-        WHERE c.teacher_id = $1
-        ORDER BY s.submitted_at DESC`,
-        [req.user!.id]
-      );
-
-      return res.json({
-        success: true,
-        submissions: result.rows,
-      });
+      const list = await getTeacherSubmissionsList(req.user!.id);
+      return res.json({ success: true, submissions: list });
     } catch (error) {
-      console.error("Failed to fetch teacher submissions:", error);
-
-      return res.status(500).json({
-        success: false,
-        error: "Failed to fetch submissions.",
-      });
-    } finally {
-      client?.release();
+      return handleServiceError(res, error, "Failed to fetch teacher submissions.");
     }
   }
 );
 
-
-app.get(
-  "/api/teacher/assignments",
+// Faculty evaluation endpoint: update evaluation status, feedback, and optional score adjustment
+app.patch(
+  "/api/teacher/submissions/:id/evaluate",
   requireAuth,
   requireRole("teacher"),
   async (req: AuthenticatedRequest, res: Response) => {
-    let client;
-
     try {
-      client = await authService.getClient();
-
-      const result = await client.query(
-        `SELECT
-          a.id,
-          a.class_id AS "classId",
-          a.title,
-          a.experiment_id AS "experimentId",
-          a.due_date AS "dueDate",
-          a.total_marks AS "totalMarks",
-          a.weight_towards_internal AS "weightTowardsInternal",
-          a.attempts_allowed AS "attemptsAllowed",
-          a.allow_free_exploration AS "allowFreeExploration",
-          a.status,
-          COUNT(DISTINCT s.student_id)::int AS "completedCount",
-          (
-            SELECT COUNT(*)::int
-            FROM class_students cs
-            WHERE cs.class_id = a.class_id
-          ) AS "totalStudents",
-          0 AS "avgScore"
-        FROM assignments a
-        JOIN classes c ON c.id = a.class_id
-        LEFT JOIN submissions s ON s.assignment_id = a.id
-        WHERE c.teacher_id = $1
-        GROUP BY a.id
-        ORDER BY a.created_at DESC`,
-        [req.user!.id]
+      const { evaluationStatus, instructorFeedback, facultyScore } = req.body || {};
+      const ipAddress = (req.headers["x-forwarded-for"] as string) || req.socket.remoteAddress;
+      const result = await evaluateSubmissionByFaculty(
+        { id: req.user!.id, name: req.user!.name },
+        req.params.id,
+        {
+          evaluationStatus,
+          instructorFeedback,
+          facultyScore,
+        },
+        {
+          ipAddress: typeof ipAddress === "string" ? ipAddress : undefined,
+          userAgent: req.headers["user-agent"],
+        }
       );
 
       return res.json({
         success: true,
-        assignments: result.rows,
+        submission: result.submission,
+        competencyReport: result.competencyReport,
       });
     } catch (error) {
-      console.error("Failed to fetch assignments:", error);
-
-      return res.status(500).json({
-        success: false,
-        error: "Failed to fetch assignments.",
-      });
-    } finally {
-      client?.release();
+      return handleServiceError(res, error, "Failed to save faculty evaluation.");
     }
   }
 );
 
-// 3. Admin Scoped Endpoints (/api/admin/*)
-app.get("/api/admin/users", requireAuth, requireRole("admin"), async (_req: AuthenticatedRequest, res: Response) => {
-  try {
-    const client = await authService.getClient();
+// Faculty Dashboard real-time statistics, recent activities, and students requiring attention
+app.get(
+  "/api/teacher/dashboard-summary",
+  requireAuth,
+  requireRole("teacher"),
+  async (req: AuthenticatedRequest, res: Response) => {
     try {
-      const result = await client.query(
-        "SELECT id, email, name, role, status, institution, last_login_at, created_at FROM users ORDER BY created_at DESC;"
-      );
-      res.json({ success: true, users: result.rows });
-    } finally {
-      client.release();
+      const summary = await getFacultyDashboardSummary(req.user!.id);
+      return res.json({ success: true, summary });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to load faculty dashboard summary.");
     }
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || "Failed to fetch users." });
   }
-});
+);
 
-app.get("/api/admin/audit-logs", requireAuth, requireRole("admin"), async (_req: AuthenticatedRequest, res: Response) => {
-  try {
-    const client = await authService.getClient();
+// Authorized individual student profile, experiment history & competency report
+app.get(
+  "/api/teacher/students/:studentId/report",
+  requireAuth,
+  requireRole("teacher"),
+  async (req: AuthenticatedRequest, res: Response) => {
     try {
-      const result = await client.query(
-        "SELECT * FROM auth_events ORDER BY created_at DESC LIMIT 50;"
+      const report = await getAuthorizedStudentReportForTeacher(
+        req.user!.id,
+        req.params.studentId
       );
-      res.json({ success: true, logs: result.rows });
-    } finally {
-      client.release();
+      return res.json({ success: true, report });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to load student report.");
     }
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || "Failed to fetch audit logs." });
   }
-});
+);
 
-app.patch("/api/admin/users/:id/status", requireAuth, requireRole("admin"), async (req: AuthenticatedRequest, res: Response) => {
-  try {
-    const targetUserId = req.params.id;
-    const { status } = req.body;
-    if (!["ACTIVE", "SUSPENDED", "DISABLED"].includes(status)) {
-      res.status(400).json({ success: false, error: "Invalid status. Must be ACTIVE, SUSPENDED, or DISABLED." });
-      return;
-    }
-    const client = await authService.getClient();
+// Comprehensive Competency Analytics (class comparisons, skill gaps, experiment perf, trends, remedial)
+app.get(
+  "/api/teacher/analytics",
+  requireAuth,
+  requireRole("teacher"),
+  async (req: AuthenticatedRequest, res: Response) => {
     try {
-      await client.query("UPDATE users SET status = $1, updated_at = NOW() WHERE id = $2;", [status, targetUserId]);
-      if (status !== "ACTIVE") {
-        await client.query("UPDATE sessions SET is_revoked = TRUE, status = 'REVOKED' WHERE user_id = $1;", [targetUserId]);
+      const classId =
+        typeof req.query.classId === "string" ? req.query.classId : undefined;
+      const analytics = await getFacultyCompetencyAnalytics(req.user!.id, classId);
+      return res.json({ success: true, analytics });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to load competency analytics.");
+    }
+  }
+);
+
+// AI Faculty Insights (advisory only; grounded in real Cloud SQL cohort/student metrics)
+app.post(
+  "/api/teacher/ai-insights",
+  requireAuth,
+  requireRole("teacher"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const classId =
+        typeof req.body?.classId === "string" ? req.body.classId : undefined;
+      const insights = await generateFacultyAiInsights(
+        { id: req.user!.id, name: req.user!.name },
+        classId
+      );
+      return res.json({ success: true, insights });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to generate AI faculty insights.");
+    }
+  }
+);
+
+// Historical assessment report data (filterable by class, experiment, date range)
+app.get(
+  "/api/teacher/reports/historical",
+  requireAuth,
+  requireRole("teacher"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const report = await getFacultyHistoricalReport(req.user!.id, {
+        classId: typeof req.query.classId === "string" ? req.query.classId : undefined,
+        experimentId:
+          typeof req.query.experimentId === "string" ? req.query.experimentId : undefined,
+        from: typeof req.query.from === "string" ? req.query.from : undefined,
+        to: typeof req.query.to === "string" ? req.query.to : undefined,
+      });
+      return res.json({ success: true, report });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to load historical assessment report.");
+    }
+  }
+);
+
+// Excel-compatible CSV export for class competency, historical assessments, or individual student
+app.get(
+  "/api/teacher/reports/export",
+  requireAuth,
+  requireRole("teacher"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const rawType = typeof req.query.type === "string" ? req.query.type : "historical";
+      const type =
+        rawType === "class_competency" || rawType === "student" || rawType === "historical"
+          ? rawType
+          : "historical";
+
+      const { filename, csv } = await buildFacultyCsvExport(req.user!.id, {
+        type,
+        classId: typeof req.query.classId === "string" ? req.query.classId : undefined,
+        studentId: typeof req.query.studentId === "string" ? req.query.studentId : undefined,
+        experimentId:
+          typeof req.query.experimentId === "string" ? req.query.experimentId : undefined,
+        from: typeof req.query.from === "string" ? req.query.from : undefined,
+        to: typeof req.query.to === "string" ? req.query.to : undefined,
+      });
+
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+      return res.status(200).send(csv);
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to generate CSV export.");
+    }
+  }
+);
+
+// ==============================================================================
+// 3. ADMIN-SCOPED ENDPOINTS (/api/admin/*)
+// ==============================================================================
+
+app.get(
+  "/api/admin/users",
+  requireAuth,
+  requireRole("admin"),
+  async (_req: AuthenticatedRequest, res: Response) => {
+    try {
+      const rows = await db
+        .select({
+          id: users.id,
+          email: users.email,
+          name: users.name,
+          role: users.role,
+          status: users.status,
+          institution: users.institution,
+          enrollment_code: users.enrollmentCode,
+          last_login_at: users.lastLoginAt,
+          created_at: users.createdAt,
+        })
+        .from(users)
+        .orderBy(desc(users.createdAt));
+
+      return res.json({ success: true, users: rows });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to fetch users.");
+    }
+  }
+);
+
+app.get(
+  "/api/admin/audit-logs",
+  requireAuth,
+  requireRole("admin"),
+  async (_req: AuthenticatedRequest, res: Response) => {
+    try {
+      const rows = await db
+        .select({
+          id: authEvents.id,
+          user_id: authEvents.userId,
+          event_type: authEvents.eventType,
+          success: authEvents.success,
+          session_id: authEvents.sessionId,
+          ip_address: authEvents.ipAddress,
+          user_agent: authEvents.userAgent,
+          metadata: authEvents.metadata,
+          created_at: authEvents.createdAt,
+        })
+        .from(authEvents)
+        .orderBy(desc(authEvents.createdAt))
+        .limit(100);
+
+      // Provide both `logs` and `events` keys for complete frontend compatibility
+      return res.json({ success: true, logs: rows, events: rows });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to fetch audit logs.");
+    }
+  }
+);
+
+app.get(
+  "/api/admin/institutions",
+  requireAuth,
+  requireRole("admin"),
+  async (_req: AuthenticatedRequest, res: Response) => {
+    try {
+      const institutions = await getAdminInstitutionsSummary();
+      return res.json({ success: true, institutions });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to fetch institutions.");
+    }
+  }
+);
+
+app.patch(
+  "/api/admin/users/:id/status",
+  requireAuth,
+  requireRole("admin"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const targetUserId = req.params.id;
+      const { status } = req.body || {};
+      if (!["ACTIVE", "SUSPENDED", "DISABLED"].includes(status)) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid status. Must be ACTIVE, SUSPENDED, or DISABLED.",
+        });
       }
-      res.json({ success: true, message: `User status updated to ${status}.` });
-    } finally {
-      client.release();
+
+      if (targetUserId === req.user!.id && status !== "ACTIVE") {
+        return res.status(400).json({
+          success: false,
+          error: "Administrators cannot suspend or disable their own active account.",
+        });
+      }
+
+      await db.transaction(async (tx) => {
+        const updated = await tx
+          .update(users)
+          .set({ status, updatedAt: new Date() })
+          .where(eq(users.id, targetUserId))
+          .returning({ id: users.id });
+
+        if (updated.length === 0) {
+          throw new Error("NOT_FOUND: User not found.");
+        }
+
+        if (status !== "ACTIVE") {
+          await tx
+            .update(sessions)
+            .set({ isRevoked: true, status: "REVOKED", revokedAt: new Date() })
+            .where(eq(sessions.userId, targetUserId));
+        }
+
+        await tx.insert(authEvents).values({
+          id: `evt-${crypto.randomUUID()}`,
+          userId: req.user!.id,
+          eventType: "ACCOUNT_STATUS_UPDATED",
+          success: true,
+          metadata: { targetUserId, newStatus: status },
+        });
+      });
+
+      return res.json({ success: true, message: `User status updated to ${status}.` });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to update user status.");
     }
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || "Failed to update status." });
   }
-});
+);
 
+// Admin class & faculty assignment management (strictly admin-only)
+app.get(
+  "/api/admin/classes",
+  requireAuth,
+  requireRole("admin"),
+  async (_req: AuthenticatedRequest, res: Response) => {
+    try {
+      const list = await listClassesForAdmin();
+      return res.json({ success: true, classes: list });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to load classes.");
+    }
+  }
+);
 
-// Vite middleware & WebSocket server setup
+app.patch(
+  "/api/admin/classes/:classId/faculty",
+  requireAuth,
+  requireRole("admin"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const rawTeacherId = req.body?.teacherId;
+      const teacherId =
+        rawTeacherId === null || rawTeacherId === ""
+          ? null
+          : typeof rawTeacherId === "string"
+          ? rawTeacherId.trim()
+          : undefined;
+      if (teacherId === undefined) {
+        return res.status(400).json({
+          success: false,
+          error: "teacherId (string or null) is required.",
+        });
+      }
+      const updated = await assignFacultyToClassByAdmin(
+        { id: req.user!.id, role: req.user!.role },
+        req.params.classId,
+        teacherId
+      );
+      return res.json({ success: true, class: updated });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to update faculty assignment.");
+    }
+  }
+);
+
+app.get(
+  "/api/admin/notifications",
+  requireAuth,
+  requireRole("admin"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const data = await getPersistentNotificationsForUser(req.user!.id, {
+        limit: 50,
+      });
+      return res.json({ success: true, ...data });
+    } catch (error) {
+      return handleServiceError(res, error, "Failed to load administrator alerts.");
+    }
+  }
+);
+
+// ==============================================================================
+// VITE MIDDLEWARE & HTTP/WS SERVER
+// ==============================================================================
 async function startServer() {
   const server = http.createServer(app);
 
-  // Initialize Pair Lab real-time WebSocket & REST endpoints
+  // Pair Lab real-time WebSocket & REST endpoints
   setupPairLabServer(server, app);
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+        watch: process.env.DISABLE_HMR === "true" ? null : undefined,
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);
@@ -1413,9 +1655,16 @@ async function startServer() {
     });
   }
 
+  server.on("error", (err) => {
+    console.error("[SimLab] HTTP server error:", err);
+  });
+
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`[SimLab] Full-stack server active on http://0.0.0.0:${PORT}`);
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error("[SimLab] Fatal error while starting server:", err);
+  process.exit(1);
+});

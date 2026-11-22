@@ -23,6 +23,7 @@ export class AuthController {
     // Public authentication routes (with rate-limiting on sensitive entrypoints)
     this.router.post("/register", authRateLimiter, this.register.bind(this));
     this.router.post("/login", authRateLimiter, this.login.bind(this));
+    this.router.post("/firebase", authRateLimiter, this.loginWithFirebase.bind(this));
     this.router.get("/verify", this.verifySession.bind(this));
     this.router.post("/refresh", this.refresh.bind(this));
     this.router.post("/forgot-password", authRateLimiter, this.forgotPassword.bind(this));
@@ -42,6 +43,7 @@ export class AuthController {
   private errorResponse(res: Response, status: number, code: string, message: string): void {
     res.status(status).json({
       success: false,
+      code,
       error: message, // Backward-compatible with existing frontend: data.error
       details: {
         code,
@@ -56,7 +58,8 @@ export class AuthController {
    */
   public async register(req: Request, res: Response): Promise<void> {
     try {
-      const { email, password, name, role, institution, enrollmentCode } = req.body;
+      const { email, password, name, role, institution, enrollmentCode, classId, classCode } =
+        req.body || {};
 
       // 1. Validate Email
       if (!email || typeof email !== "string" || !email.includes("@")) {
@@ -81,7 +84,7 @@ export class AuthController {
         return;
       }
 
-      // 4. Validate Role & Prevent Role Escalation (Requirement 3 & 5)
+      // 4. Validate Role & Prevent Role Escalation
       // Only "student" or "teacher" can register; "admin" cannot be self-registered
       const normalizedRole = typeof role === "string" ? (role.toLowerCase() as UserRole) : null;
       if (!normalizedRole || (normalizedRole !== "student" && normalizedRole !== "teacher")) {
@@ -90,6 +93,24 @@ export class AuthController {
           400,
           "INVALID_ROLE",
           "Invalid role specified. Only 'student' and 'teacher' accounts may be registered."
+        );
+        return;
+      }
+
+      // 5. Require class selection for students (accept classId or classCode)
+      const selectedClass =
+        typeof classId === "string" && classId.trim().length > 0
+          ? classId.trim()
+          : typeof classCode === "string" && classCode.trim().length > 0
+          ? classCode.trim()
+          : undefined;
+
+      if (normalizedRole === "student" && !selectedClass) {
+        this.errorResponse(
+          res,
+          400,
+          "MISSING_CLASS_SELECTION",
+          "Please select a class cohort (e.g., PHY101-A or SCI204-B) to enroll in."
         );
         return;
       }
@@ -105,26 +126,57 @@ export class AuthController {
           role: normalizedRole,
           institution,
           enrollmentCode,
+          classId: selectedClass,
         },
         { userAgent, ipAddress }
       );
 
       res.status(201).json({
         success: true,
-        message: "Account registered successfully.",
+        message: authResult.enrollment
+          ? `Account registered and enrolled in ${authResult.enrollment.classCode}.`
+          : "Account registered successfully.",
         user: authResult.user,
         token: authResult.token,
         refreshToken: authResult.refreshToken,
         session: authResult.session,
+        enrollment: authResult.enrollment,
       });
     } catch (err: any) {
-      const message = err?.message || "Registration failed. Please try again.";
-      const status = message.includes("already exists") ? 409 : 500;
+      const rawMessage = err?.message || "Registration failed. Please try again.";
+      if (rawMessage.startsWith("INVALID_CLASS:")) {
+        this.errorResponse(
+          res,
+          400,
+          "INVALID_CLASS",
+          rawMessage.replace("INVALID_CLASS:", "").trim()
+        );
+        return;
+      }
+      if (rawMessage.startsWith("UNASSIGNED_FACULTY:")) {
+        this.errorResponse(
+          res,
+          422,
+          "UNASSIGNED_FACULTY",
+          rawMessage.replace("UNASSIGNED_FACULTY:", "").trim()
+        );
+        return;
+      }
+      if (rawMessage.startsWith("DUPLICATE_ENROLLMENT:")) {
+        this.errorResponse(
+          res,
+          409,
+          "DUPLICATE_ENROLLMENT",
+          rawMessage.replace("DUPLICATE_ENROLLMENT:", "").trim()
+        );
+        return;
+      }
+      const status = rawMessage.includes("already exists") ? 409 : 500;
       this.errorResponse(
         res,
         status,
         status === 409 ? "USER_ALREADY_EXISTS" : "REGISTRATION_FAILED",
-        message
+        rawMessage
       );
     }
   }
@@ -172,6 +224,45 @@ export class AuthController {
       const message = err?.message || "Authentication failed.";
       const status = message.includes("suspended") || message.includes("disabled") ? 403 : 401;
       this.errorResponse(res, status, "INVALID_CREDENTIALS", message);
+    }
+  }
+
+  /**
+   * POST /api/auth/firebase
+   * Verifies Firebase ID token from Google Sign-In, syncs user to PostgreSQL, and issues session
+   */
+  public async loginWithFirebase(req: Request, res: Response): Promise<void> {
+    try {
+      const idToken =
+        typeof req.body?.idToken === "string"
+          ? req.body.idToken.trim()
+          : extractToken(req);
+
+      if (!idToken) {
+        this.errorResponse(res, 400, "MISSING_FIREBASE_TOKEN", "Firebase ID token is required.");
+        return;
+      }
+
+      const userAgent = req.headers["user-agent"];
+      const ipAddress = (req.headers["x-forwarded-for"] as string) || req.socket.remoteAddress;
+
+      const authResult = await authService.loginWithFirebaseIdToken(idToken, {
+        userAgent,
+        ipAddress: typeof ipAddress === "string" ? ipAddress : undefined,
+      });
+
+      res.status(200).json({
+        success: true,
+        message: "Signed in with Google successfully.",
+        user: authResult.user,
+        token: authResult.token,
+        refreshToken: authResult.refreshToken,
+        session: authResult.session,
+      });
+    } catch (err: any) {
+      const message = err?.message || "Google sign-in verification failed.";
+      const status = message.includes("suspended") || message.includes("disabled") ? 403 : 401;
+      this.errorResponse(res, status, "FIREBASE_AUTH_FAILED", message);
     }
   }
 

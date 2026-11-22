@@ -14,11 +14,11 @@ interface StudentProfileViewProps {
 export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
   currentUser,
   competencyScores = {
-    setup_adherence: 95,
-    measurement_precision: 88,
-    data_interpretation: 94,
-    troubleshooting_safety: 90,
-    experimental_design: 92,
+    setup_adherence: 0,
+    measurement_precision: 0,
+    data_interpretation: 0,
+    troubleshooting_safety: 0,
+    experimental_design: 0,
   },
 }) => {
   const [selectedMilestone, setSelectedMilestone] = useState<StudentMilestoneStatus | null>(null);
@@ -56,7 +56,7 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
               <Building className="h-3.5 w-3.5" /> Institution / University
             </span>
             <p className="font-semibold text-stone-900 dark:text-stone-100">
-              {currentUser.institution || 'Delhi University • Faculty of Science'}
+              {currentUser.institution || 'Not specified'}
             </p>
           </div>
 
@@ -65,7 +65,7 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
               <Key className="h-3.5 w-3.5" /> Enrollment ID / Student Code
             </span>
             <p className="font-mono font-semibold text-amber-700 dark:text-amber-400">
-              {currentUser.enrollmentCode || 'STU-2026-081'}
+              {currentUser.enrollmentCode || currentUser.id.slice(0, 12)}
             </p>
           </div>
 

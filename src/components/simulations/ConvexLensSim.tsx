@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   Eye,
   Sliders,
@@ -45,11 +45,17 @@ export interface LensTrialDataPoint {
 
 interface ConvexLensSimProps {
   onDataLogged?: (count: number) => void;
+  onSnapshotChange?: (snapshot: {
+    observations: Record<string, unknown>;
+    calculatedResults: Record<string, unknown>;
+    readingsCount: number;
+  }) => void;
   isDark?: boolean;
 }
 
 export const ConvexLensSim: React.FC<ConvexLensSimProps> = ({
   onDataLogged,
+  onSnapshotChange,
   isDark = false,
 }) => {
   // Nominal focal length of the biconvex lens
@@ -240,6 +246,34 @@ export const ConvexLensSim: React.FC<ConvexLensSimProps> = ({
       validCount: loggedTrials.length,
     };
   }, [loggedTrials, nominalFocalLength]);
+
+  useEffect(() => {
+    if (!onSnapshotChange) return;
+    onSnapshotChange({
+      observations: {
+        apparatus: 'Dual-Rail Optical Bench (u-v Method)',
+        nominalFocalLengthCm: nominalFocalLength,
+        trials: loggedTrials.map((t, idx) => ({
+          trial: idx + 1,
+          uCm: t.u,
+          vCm: t.v,
+          invU: t.inv_u,
+          invV: t.inv_v,
+          fCalcCm: t.f_calc,
+          magnification: t.magnification,
+          sharpnessPct: t.sharpness,
+        })),
+      },
+      calculatedResults: {
+        meanFocalLengthCm: stats.meanF,
+        stdDevCm: stats.stdDev,
+        errorPercent: stats.errorPercent,
+        lensPowerDioptres: stats.meanF > 0 ? parseFloat((100 / stats.meanF).toFixed(2)) : null,
+        readingsCount: loggedTrials.length,
+      },
+      readingsCount: loggedTrials.length,
+    });
+  }, [loggedTrials, stats, nominalFocalLength, onSnapshotChange]);
 
   // Log current trial to observation table
   const handleLogTrial = () => {

@@ -30,9 +30,19 @@ import {
   School,
   Plus,
   ChevronDown,
+  Bell,
+  CheckCheck,
+  AlertTriangle,
+  Calendar,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { UserRole, CurrentUser, ClassCourse } from '../../types';
+import {
+  UserRole,
+  CurrentUser,
+  ClassCourse,
+  StudentNotification,
+  FacultyNotification,
+} from '../../types';
 import { RoleBadge } from '../common/RoleBadge';
 
 export interface NavItem {
@@ -62,6 +72,7 @@ export const TEACHER_NAV_ITEMS: NavItem[] = [
   { id: 'experiments', label: 'Experiment Catalog', path: '/teacher/experiments', icon: FlaskConical },
   { id: 'analytics', label: 'Competency Analytics', path: '/teacher/analytics', icon: BarChart3 },
   { id: 'review', label: 'Submissions & Review', path: '/teacher/review', icon: ClipboardList, badge: 'Audit' },
+  { id: 'reports', label: 'Assessment Reports', path: '/teacher/reports', icon: FileCheck },
   { id: 'profile', label: 'Faculty Profile', path: '/teacher/profile', icon: User },
 ];
 
@@ -90,6 +101,18 @@ export interface AppShellProps {
   selectedFacultyClassId?: string;
   onSelectFacultyClassId?: (id: string) => void;
   onFacultyQuickAssign?: () => void;
+  // Faculty notifications
+  facultyNotifications?: FacultyNotification[];
+  unreadFacultyNotificationsCount?: number;
+  onMarkFacultyNotificationRead?: (id: string) => void;
+  onMarkAllFacultyNotificationsRead?: () => void;
+  onFacultyNotificationSelect?: (notification: FacultyNotification) => void;
+  // Student notifications
+  studentNotifications?: StudentNotification[];
+  unreadNotificationsCount?: number;
+  onMarkNotificationRead?: (key: string) => void;
+  onMarkAllNotificationsRead?: () => void;
+  onNotificationSelect?: (notification: StudentNotification) => void;
   children: React.ReactNode;
 }
 
@@ -106,9 +129,20 @@ export const AppShell: React.FC<AppShellProps> = ({
   selectedFacultyClassId,
   onSelectFacultyClassId,
   onFacultyQuickAssign,
+  facultyNotifications = [],
+  unreadFacultyNotificationsCount = 0,
+  onMarkFacultyNotificationRead,
+  onMarkAllFacultyNotificationsRead,
+  onFacultyNotificationSelect,
+  studentNotifications = [],
+  unreadNotificationsCount = 0,
+  onMarkNotificationRead,
+  onMarkAllNotificationsRead,
+  onNotificationSelect,
   children,
 }) => {
   const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
+  const [notificationsOpen, setNotificationsOpen] = useState<boolean>(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
     if (typeof window !== 'undefined') {
       const saved = localStorage.getItem('simlab_sidebar_collapsed');
@@ -620,6 +654,256 @@ export const AppShell: React.FC<AppShellProps> = ({
             <div className="hidden md:block">
               <RoleBadge role={currentRole} />
             </div>
+
+            {/* Student Notifications Bell & Dropdown */}
+            {currentRole === 'student' && (
+              <div className="relative">
+                <button
+                  type="button"
+                  id="student-notifications-bell-btn"
+                  onClick={() => setNotificationsOpen((prev) => !prev)}
+                  aria-label="Open notifications"
+                  title="Assignments, deadlines & evaluation alerts"
+                  className="relative z-40 flex items-center justify-center rounded-xl border border-stone-200 dark:border-stone-800 bg-stone-100 dark:bg-stone-800 p-2 text-stone-700 dark:text-stone-300 hover:bg-stone-200 dark:hover:bg-stone-700 transition-colors cursor-pointer"
+                >
+                  <Bell className="h-4 w-4" />
+                  {unreadNotificationsCount > 0 && (
+                    <span
+                      id="student-notifications-unread-badge"
+                      className="absolute -top-1 -right-1 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-rose-600 px-1 text-[10px] font-bold text-white shadow-xs"
+                    >
+                      {unreadNotificationsCount > 9 ? '9+' : unreadNotificationsCount}
+                    </span>
+                  )}
+                </button>
+
+                {notificationsOpen && (
+                  <>
+                    <div
+                      className="fixed inset-0 z-30"
+                      onClick={() => setNotificationsOpen(false)}
+                    />
+                    <div
+                      id="student-notifications-popover"
+                      className="absolute right-0 mt-2 z-40 w-80 sm:w-96 rounded-2xl border border-stone-200 dark:border-stone-800 bg-white dark:bg-stone-900 shadow-2xl overflow-hidden"
+                    >
+                      <div className="flex items-center justify-between border-b border-stone-100 dark:border-stone-800 px-4 py-3 bg-stone-50/70 dark:bg-stone-850/70">
+                        <div>
+                          <h3 className="text-xs font-bold text-stone-900 dark:text-stone-100">
+                            Student Notifications
+                          </h3>
+                          <p className="text-[10px] text-stone-500 dark:text-stone-400">
+                            {unreadNotificationsCount} unread alert{unreadNotificationsCount === 1 ? '' : 's'}
+                          </p>
+                        </div>
+                        {unreadNotificationsCount > 0 && onMarkAllNotificationsRead && (
+                          <button
+                            type="button"
+                            onClick={() => onMarkAllNotificationsRead()}
+                            className="inline-flex items-center gap-1 rounded-lg border border-stone-200 dark:border-stone-700 bg-white dark:bg-stone-800 px-2 py-1 text-[10px] font-semibold text-stone-700 dark:text-stone-300 hover:text-amber-600 dark:hover:text-amber-400 cursor-pointer"
+                          >
+                            <CheckCheck className="h-3 w-3" />
+                            <span>Mark all read</span>
+                          </button>
+                        )}
+                      </div>
+
+                      <div className="max-h-96 overflow-y-auto divide-y divide-stone-100 dark:divide-stone-800">
+                        {studentNotifications.length > 0 ? (
+                          studentNotifications.map((notif) => {
+                            const badgeColor =
+                              notif.severity === 'urgent'
+                                ? 'bg-rose-100 text-rose-800 dark:bg-rose-950/70 dark:text-rose-300'
+                                : notif.severity === 'warning'
+                                ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/70 dark:text-amber-300'
+                                : notif.severity === 'success'
+                                ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/70 dark:text-emerald-300'
+                                : 'bg-stone-100 text-stone-700 dark:bg-stone-800 dark:text-stone-300';
+                            return (
+                              <button
+                                key={notif.id}
+                                type="button"
+                                onClick={() => {
+                                  if (!notif.isRead && onMarkNotificationRead) {
+                                    onMarkNotificationRead(notif.id);
+                                  }
+                                  setNotificationsOpen(false);
+                                  if (onNotificationSelect) {
+                                    onNotificationSelect(notif);
+                                  } else {
+                                    onNavigate(notif.actionPath);
+                                  }
+                                }}
+                                className={`w-full text-left px-4 py-3 transition-colors hover:bg-stone-50 dark:hover:bg-stone-800/60 cursor-pointer ${
+                                  notif.isRead ? 'opacity-70' : 'bg-amber-50/30 dark:bg-amber-950/10'
+                                }`}
+                              >
+                                <div className="flex items-start justify-between gap-2">
+                                  <span
+                                    className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-bold uppercase ${badgeColor}`}
+                                  >
+                                    {notif.type === 'deadline' && <AlertTriangle className="h-2.5 w-2.5" />}
+                                    {notif.type === 'assignment' && <Calendar className="h-2.5 w-2.5" />}
+                                    {notif.type === 'evaluation' && <CheckCircle2 className="h-2.5 w-2.5" />}
+                                    {notif.type === 'viva_report' && <Sparkles className="h-2.5 w-2.5" />}
+                                    <span>{notif.type.replace('_', ' ')}</span>
+                                  </span>
+                                  <div className="flex items-center gap-1.5">
+                                    {!notif.isRead && (
+                                      <span className="h-2 w-2 rounded-full bg-amber-500" />
+                                    )}
+                                    <span className="text-[10px] text-stone-400">
+                                      {new Date(notif.createdAt).toLocaleDateString()}
+                                    </span>
+                                  </div>
+                                </div>
+                                <p className="mt-1 text-xs font-bold text-stone-900 dark:text-stone-100 line-clamp-1">
+                                  {notif.title}
+                                </p>
+                                <p className="mt-0.5 text-[11px] text-stone-600 dark:text-stone-400 line-clamp-2 leading-snug">
+                                  {notif.message}
+                                </p>
+                              </button>
+                            );
+                          })
+                        ) : (
+                          <div className="px-4 py-8 text-center text-xs text-stone-500 dark:text-stone-400">
+                            You&apos;re all caught up — no pending alerts or deadlines.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+
+            {/* Faculty Enrollment & Cohort Notifications Bell & Dropdown */}
+            {currentRole === 'teacher' && (
+              <div className="relative">
+                <button
+                  type="button"
+                  id="faculty-notifications-bell-btn"
+                  onClick={() => setNotificationsOpen((prev) => !prev)}
+                  aria-label="Open faculty notifications"
+                  title="Student enrollment and cohort alerts"
+                  className="relative z-40 flex items-center justify-center rounded-xl border border-stone-200 dark:border-stone-800 bg-stone-100 dark:bg-stone-800 p-2 text-stone-700 dark:text-stone-300 hover:bg-stone-200 dark:hover:bg-stone-700 transition-colors cursor-pointer"
+                >
+                  <Bell className="h-4 w-4" />
+                  {unreadFacultyNotificationsCount > 0 && (
+                    <span
+                      id="faculty-notifications-unread-badge"
+                      className="absolute -top-1 -right-1 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-indigo-600 px-1 text-[10px] font-bold text-white shadow-xs"
+                    >
+                      {unreadFacultyNotificationsCount > 9 ? '9+' : unreadFacultyNotificationsCount}
+                    </span>
+                  )}
+                </button>
+
+                {notificationsOpen && (
+                  <>
+                    <div
+                      className="fixed inset-0 z-30"
+                      onClick={() => setNotificationsOpen(false)}
+                    />
+                    <div
+                      id="faculty-notifications-popover"
+                      className="absolute right-0 mt-2 z-40 w-80 sm:w-96 rounded-2xl border border-stone-200 dark:border-stone-800 bg-white dark:bg-stone-900 shadow-2xl overflow-hidden"
+                    >
+                      <div className="flex items-center justify-between border-b border-stone-100 dark:border-stone-800 px-4 py-3 bg-indigo-50/40 dark:bg-indigo-950/30">
+                        <div>
+                          <h3 className="text-xs font-bold text-stone-900 dark:text-stone-100">
+                            Faculty Notifications
+                          </h3>
+                          <p className="text-[10px] text-stone-500 dark:text-stone-400">
+                            {unreadFacultyNotificationsCount} unread enrollment alert
+                            {unreadFacultyNotificationsCount === 1 ? '' : 's'}
+                          </p>
+                        </div>
+                        {unreadFacultyNotificationsCount > 0 && onMarkAllFacultyNotificationsRead && (
+                          <button
+                            type="button"
+                            id="faculty-mark-all-read-btn"
+                            onClick={() => onMarkAllFacultyNotificationsRead()}
+                            className="inline-flex items-center gap-1 rounded-lg border border-stone-200 dark:border-stone-700 bg-white dark:bg-stone-800 px-2 py-1 text-[10px] font-semibold text-stone-700 dark:text-stone-300 hover:text-indigo-600 dark:hover:text-indigo-400 cursor-pointer"
+                          >
+                            <CheckCheck className="h-3 w-3" />
+                            <span>Mark all read</span>
+                          </button>
+                        )}
+                      </div>
+
+                      <div className="max-h-96 overflow-y-auto divide-y divide-stone-100 dark:divide-stone-800">
+                        {facultyNotifications.length > 0 ? (
+                          facultyNotifications.map((notif) => (
+                            <button
+                              key={notif.id}
+                              type="button"
+                              onClick={() => {
+                                if (!notif.isRead && onMarkFacultyNotificationRead) {
+                                  onMarkFacultyNotificationRead(notif.id);
+                                }
+                                setNotificationsOpen(false);
+                                if (onFacultyNotificationSelect) {
+                                  onFacultyNotificationSelect(notif);
+                                } else {
+                                  onNavigate(notif.metadata?.actionPath || '/teacher/classes');
+                                }
+                              }}
+                              className={`w-full text-left px-4 py-3 transition-colors hover:bg-stone-50 dark:hover:bg-stone-800/60 cursor-pointer ${
+                                notif.isRead
+                                  ? 'opacity-70'
+                                  : 'bg-indigo-50/40 dark:bg-indigo-950/20'
+                              }`}
+                            >
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="flex items-center gap-1.5">
+                                  <span className="inline-flex items-center gap-1 rounded bg-indigo-100 dark:bg-indigo-950/80 px-1.5 py-0.5 text-[9px] font-bold uppercase text-indigo-800 dark:text-indigo-300">
+                                    <Users className="h-2.5 w-2.5" />
+                                    <span>{notif.metadata?.classCode || 'Enrollment'}</span>
+                                  </span>
+                                  {!notif.isRead && (
+                                    <span className="rounded bg-emerald-100 dark:bg-emerald-950/70 px-1.5 py-0.5 text-[9px] font-bold uppercase text-emerald-700 dark:text-emerald-300">
+                                      New
+                                    </span>
+                                  )}
+                                </div>
+                                <span className="text-[10px] text-stone-400">
+                                  {new Date(notif.createdAt).toLocaleString([], {
+                                    month: 'short',
+                                    day: 'numeric',
+                                    hour: '2-digit',
+                                    minute: '2-digit',
+                                  })}
+                                </span>
+                              </div>
+                              <p className="mt-1 text-xs font-bold text-stone-900 dark:text-stone-100 line-clamp-1">
+                                {notif.title}
+                              </p>
+                              <p className="mt-0.5 text-[11px] text-stone-600 dark:text-stone-400 line-clamp-2 leading-snug">
+                                {notif.message}
+                              </p>
+                              {notif.metadata?.studentEmail && (
+                                <p className="mt-1 text-[10px] text-stone-400 font-mono truncate">
+                                  {notif.metadata.studentEmail}
+                                  {notif.metadata.studentEnrollmentCode
+                                    ? ` • ${notif.metadata.studentEnrollmentCode}`
+                                    : ''}
+                                </p>
+                              )}
+                            </button>
+                          ))
+                        ) : (
+                          <div className="px-4 py-8 text-center text-xs text-stone-500 dark:text-stone-400">
+                            No student enrollment notifications yet for your classes.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
 
             {/* Theme Toggle Button */}
             <button

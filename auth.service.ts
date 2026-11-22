@@ -2,9 +2,15 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
 import { Pool, PoolClient } from "pg";
-import fs from "fs";
-import path from "path";
-import { newDb } from "pg-mem";
+import { eq, sql } from "drizzle-orm";
+import { db, pool as sharedPool } from "./src/db/index.ts";
+import { users, sessions, authEvents } from "./src/db/schema.ts";
+import { adminAuth } from "./src/lib/firebase-admin.ts";
+import { validateRegistrationClassSelection } from "./src/server/enrollmentEngine.ts";
+import {
+  enrollStudentInClassWithinTransaction,
+  type EnrollmentOutcome,
+} from "./src/server/enrollmentService.ts";
 
 export type UserRole = "student" | "teacher" | "admin";
 export type UserStatus = "ACTIVE" | "SUSPENDED" | "DISABLED";
@@ -13,6 +19,7 @@ export type AuthEventType =
   | "REGISTER"
   | "LOGIN_SUCCESS"
   | "LOGIN_FAILURE"
+  | "FIREBASE_LOGIN_SUCCESS"
   | "LOGOUT"
   | "LOGOUT_ALL"
   | "TOKEN_REFRESH"
@@ -21,10 +28,12 @@ export type AuthEventType =
   | "PASSWORD_CHANGE_FAILED"
   | "PASSWORD_RESET_REQUEST"
   | "PASSWORD_RESET"
-  | "ACCOUNT_LOCKED";
+  | "ACCOUNT_LOCKED"
+  | "FACULTY_EVALUATION";
 
 export interface UserRecord {
   id: string;
+  firebase_uid?: string | null;
   email: string;
   password_hash: string;
   name: string;
@@ -82,6 +91,7 @@ export interface RegisterDTO {
   role: UserRole;
   institution?: string;
   enrollmentCode?: string;
+  classId?: string;
 }
 
 export interface LoginDTO {
@@ -110,296 +120,51 @@ export interface AuthResult {
     id: string;
     expiresAt: string;
   };
+  enrollment?: EnrollmentOutcome;
 }
-
-/**
- * ==============================================================================
- * TOKEN STORAGE STRATEGY (Requirement 13 & 14)
- * ==============================================================================
- * 1. Access Tokens:
- *    - Short-lived JSON Web Tokens signed with HS256 using JWT_SECRET.
- *    - Configurable lifetime (default: 15 minutes, via JWT_ACCESS_EXPIRES_IN).
- *    - Carries authenticated identity claims (userId, role, email, name, sessionId).
- *
- * 2. Refresh Tokens:
- *    - Long-lived cryptographically secure 256-bit random tokens (crypto.randomBytes(32)).
- *    - Configurable lifetime (default: 7 days, via JWT_REFRESH_EXPIRES_IN).
- *
- * 3. Database Security Policy:
- *    - RAW REFRESH TOKENS AND ACCESS TOKENS ARE NEVER STORED IN POSTGRESQL.
- *    - The database exclusively persists deterministic SHA-256 hashes:
- *      - `sessions.token_hash`: SHA-256 hash of the currently valid access token.
- *      - `sessions.refresh_token_hash`: SHA-256 hash of the currently valid refresh token.
- *    - When the client submits an access or refresh token, the server computes its SHA-256
- *      digest and compares it against the indexed hash columns in the database.
- *    - Even in the event of an unauthorized database dump, no usable tokens or passwords can be replayed.
- * ==============================================================================
- */
 
 class AuthService {
   private jwtSecret: string;
   private jwtAccessExpiry: string;
   private jwtRefreshExpiryDays: number;
   private bcryptRounds: number;
-  private pool: Pool | null = null;
-  private dbInitialized = false;
-  private dbAvailable = false;
-  private isProduction = process.env.NODE_ENV === "production";
-
-  // Pre-seeded authentic user accounts for immediate out-of-the-box readiness
-  private defaultSeedUsers: UserRecord[] = [];
+  private pool: Pool;
 
   constructor() {
-    this.jwtSecret = process.env.JWT_SECRET || "simlab-secret-jwt-key-production-ready-2026";
-    this.jwtAccessExpiry = process.env.JWT_ACCESS_EXPIRES_IN || "15m";
+    if (process.env.JWT_SECRET && process.env.JWT_SECRET.trim().length >= 16) {
+      this.jwtSecret = process.env.JWT_SECRET.trim();
+    } else {
+      // Derive a process-local random secret when JWT_SECRET is not configured, avoiding hardcoded secrets
+      this.jwtSecret = crypto.randomBytes(32).toString("hex");
+      console.warn(
+        "[AuthService] JWT_SECRET not configured; generated ephemeral runtime secret. Set JWT_SECRET in environment for persistent tokens across restarts."
+      );
+    }
+
+    this.jwtAccessExpiry = process.env.JWT_ACCESS_EXPIRES_IN || "2h";
     this.jwtRefreshExpiryDays = 7;
     this.bcryptRounds = parseInt(process.env.BCRYPT_ROUNDS || "10", 10);
-
-    this.initDefaultUsers();
-    this.initDatabase();
+    // Use the lazy Cloud SQL PostgreSQL connection pool (no eager startup probes, no pg-mem fallback)
+    this.pool = sharedPool;
   }
 
   /**
-   * Initialize static seed user definitions
-   */
-  private initDefaultUsers(): void {
-    const salt = bcrypt.genSaltSync(this.bcryptRounds);
-    const demoHashedPassword = bcrypt.hashSync("password123", salt);
-    const adminHashedPassword = bcrypt.hashSync("Admin@SimLab2026!", salt);
-
-    this.defaultSeedUsers = [
-      {
-        id: "usr-student-1",
-        email: "aarav.sharma@university.edu",
-        password_hash: demoHashedPassword,
-        name: "Aarav Sharma",
-        role: "student",
-        status: "ACTIVE",
-        institution: "National Institute of Science & Technology",
-        enrollment_code: "PHYS-2026-A",
-        last_login_at: null,
-        created_at: "2026-08-15T10:00:00.000Z",
-      },
-      {
-        id: "usr-teacher-1",
-        email: "dr.ananya.sen@university.edu",
-        password_hash: demoHashedPassword,
-        name: "Dr. Ananya Sen",
-        role: "teacher",
-        status: "ACTIVE",
-        institution: "Department of Physics & Applied Sciences",
-        enrollment_code: "DEPT-PHYS-LEAD",
-        last_login_at: null,
-        created_at: "2026-08-01T08:30:00.000Z",
-      },
-      {
-        id: "usr-admin-1",
-        email: "admin.lead@university.edu",
-        password_hash: adminHashedPassword,
-        name: "Central Administrator",
-        role: "admin",
-        status: "ACTIVE",
-        institution: "SimLab Central Institutional Administration",
-        enrollment_code: "SYS-ADMIN-CORE",
-        last_login_at: null,
-        created_at: "2026-07-01T00:00:00.000Z",
-      },
-    ];
-  }
-
-  /**
-   * Initialize connection pool to PostgreSQL or SQL-compliant engine
+   * Retained for compatibility with existing callers/tests.
+   * Connection pooling is lazy via pg.Pool — no eager startup probes are executed.
    */
   public async initDatabase(): Promise<void> {
-    if (this.dbInitialized && this.pool) return;
-
-    // 1. Try external PostgreSQL connection if configured
-    if (process.env.DATABASE_URL || process.env.SQL_HOST) {
-      try {
-        const connectionConfig = process.env.DATABASE_URL
-          ? { connectionString: process.env.DATABASE_URL, connectionTimeoutMillis: 2000 }
-          : {
-              host: process.env.SQL_HOST || process.env.PGHOST || "127.0.0.1",
-              port: parseInt(process.env.PGPORT || "5432", 10),
-              user: process.env.SQL_USER || process.env.PGUSER || "postgres",
-              password: process.env.SQL_PASSWORD || process.env.PGPASSWORD || "",
-              database: process.env.SQL_DB_NAME || process.env.PGDATABASE || "simlab",
-              connectionTimeoutMillis: 2000,
-            };
-
-        const externalPool = new Pool(connectionConfig);
-        externalPool.on("error", (err) => {
-          console.warn("[AuthService:PostgreSQL] Pool error:", err.message);
-        });
-
-        const client = await externalPool.connect();
-        try {
-          await this.applyMigrations(client);
-          this.pool = externalPool;
-          this.dbAvailable = true;
-          this.dbInitialized = true;
-          console.log("[AuthService:PostgreSQL] Connected to external PostgreSQL database.");
-          return;
-        } finally {
-          client.release();
-        }
-      } catch (err: any) {
-        if (this.isProduction) {
-          console.error("[AuthService:PostgreSQL] Production database connection failed:", err.message);
-          this.dbAvailable = false;
-          this.dbInitialized = true;
-          throw new Error(`Production database unavailable: ${err.message}`);
-        }
-        console.log(
-          `[AuthService:PostgreSQL] External database unavailable (${err?.message || "offline"}). Booting SQL-compliant PostgreSQL engine for development/test.`
-        );
-      }
-    }
-
-    // 2. Development & Test Fallback: SQL-compliant engine
-    // Requirement 24: In development/test mode, initialize SQL engine executing real PostgreSQL DDL & DML
-    try {
-      const db = newDb();
-      const pgAdapter = db.adapters.createPg();
-      const localPool = new pgAdapter.Pool();
-
-      const client = await localPool.connect();
-      try {
-        await this.applyMigrations(client);
-        this.pool = localPool as unknown as Pool;
-        this.dbAvailable = true;
-        this.dbInitialized = true;
-        console.log("[AuthService:PostgreSQL] SQL-compliant PostgreSQL database engine initialized successfully.");
-      } finally {
-        client.release();
-      }
-    } catch (err: any) {
-      console.error("[AuthService:PostgreSQL] Failed to initialize SQL database engine:", err);
-      this.dbAvailable = false;
-      this.dbInitialized = true;
-    }
+    return;
   }
 
   /**
-   * Apply database schema DDL migrations and seed default users
-   */
-  private async applyMigrations(client: PoolClient): Promise<void> {
-    const migrationPath = path.join(process.cwd(), "migrations", "001_auth_schema.sql");
-    let ddl: string;
-
-    if (fs.existsSync(migrationPath)) {
-      ddl = fs.readFileSync(migrationPath, "utf-8");
-    } else {
-      ddl = `
-        CREATE TABLE IF NOT EXISTS users (
-          id VARCHAR(64) PRIMARY KEY,
-          email VARCHAR(255) UNIQUE NOT NULL,
-          password_hash VARCHAR(255) NOT NULL,
-          name VARCHAR(255) NOT NULL,
-          role VARCHAR(32) NOT NULL CHECK (role IN ('student', 'teacher', 'admin')),
-          status VARCHAR(32) NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'SUSPENDED', 'DISABLED')),
-          institution VARCHAR(255) DEFAULT '',
-          enrollment_code VARCHAR(128),
-          last_login_at TIMESTAMP WITH TIME ZONE,
-          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-          updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS sessions (
-          id VARCHAR(64) PRIMARY KEY,
-          user_id VARCHAR(64) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-          token_hash VARCHAR(64) NOT NULL,
-          refresh_token_hash VARCHAR(64),
-          user_agent TEXT,
-          ip_address VARCHAR(64),
-          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-          expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-          last_activity_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-          revoked_at TIMESTAMP WITH TIME ZONE,
-          status VARCHAR(32) NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'LOGGED_OUT', 'REVOKED', 'EXPIRED')),
-          is_revoked BOOLEAN DEFAULT FALSE
-        );
-
-        CREATE TABLE IF NOT EXISTS auth_events (
-          id VARCHAR(64) PRIMARY KEY,
-          user_id VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
-          event_type VARCHAR(64) NOT NULL,
-          success BOOLEAN NOT NULL,
-          session_id VARCHAR(64),
-          ip_address VARCHAR(64),
-          user_agent TEXT,
-          metadata JSONB,
-          created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS password_resets (
-          id VARCHAR(64) PRIMARY KEY,
-          user_id VARCHAR(64) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-          token_hash VARCHAR(64) NOT NULL,
-          expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-          used_at TIMESTAMP WITH TIME ZONE,
-          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-        CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
-        CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
-        CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
-        CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
-        CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
-        CREATE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(token_hash);
-        CREATE INDEX IF NOT EXISTS idx_sessions_refresh_hash ON sessions(refresh_token_hash);
-        CREATE INDEX IF NOT EXISTS idx_auth_events_user_id ON auth_events(user_id);
-        CREATE INDEX IF NOT EXISTS idx_auth_events_created_at ON auth_events(created_at);
-        CREATE INDEX IF NOT EXISTS idx_auth_events_event_type ON auth_events(event_type);
-        CREATE INDEX IF NOT EXISTS idx_password_resets_token_hash ON password_resets(token_hash);
-      `;
-    }
-
-    await client.query(ddl);
-
-    // Seed default authentic accounts if table is empty
-    const checkRes = await client.query("SELECT COUNT(*) FROM users;");
-    const count = parseInt(checkRes.rows[0].count, 10);
-    if (count === 0) {
-      for (const user of this.defaultSeedUsers) {
-        await client.query(
-          `INSERT INTO users (id, email, password_hash, name, role, status, institution, enrollment_code, last_login_at, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-           ON CONFLICT (email) DO NOTHING;`,
-          [
-            user.id,
-            user.email,
-            user.password_hash,
-            user.name,
-            user.role,
-            user.status,
-            user.institution,
-            user.enrollment_code || null,
-            user.last_login_at || null,
-            user.created_at,
-            user.created_at,
-          ]
-        );
-      }
-    }
-  }
-
-  /**
-   * Acquire database client from connection pool
+   * Acquire database client from the Cloud SQL PostgreSQL connection pool.
    */
   public async getClient(): Promise<PoolClient> {
-    if (!this.pool) {
-      await this.initDatabase();
-    }
-    if (!this.pool) {
-      throw new Error("Database pool is unavailable.");
-    }
     return this.pool.connect();
   }
 
   /**
-   * Hash a plaintext password with bcrypt salt work factor 10
+   * Hash a plaintext password with bcrypt
    */
   public async hashPassword(password: string): Promise<string> {
     const salt = await bcrypt.genSalt(this.bcryptRounds);
@@ -448,7 +213,7 @@ class AuthService {
   }
 
   /**
-   * Record an authentication audit event into auth_events table
+   * Record an authentication or security audit event into auth_events table
    */
   public async recordAuthEvent(
     event: Omit<AuthEventRecord, "id" | "created_at">,
@@ -483,6 +248,150 @@ class AuthService {
   }
 
   /**
+   * Authenticate with a Firebase Auth ID Token (Google Sign-In).
+   * Verifies the token via Firebase Admin SDK, upserts the user record in Cloud SQL
+   * using Drizzle's onConflictDoUpdate, and opens a database-tracked session.
+   */
+  public async loginWithFirebaseIdToken(
+    idToken: string,
+    clientInfo?: { userAgent?: string; ipAddress?: string }
+  ): Promise<AuthResult> {
+    if (!idToken) {
+      throw new Error("Firebase ID token is required.");
+    }
+
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const uid = decoded.uid;
+    const emailNorm = (decoded.email || `${uid}@firebase.local`).trim().toLowerCase();
+    const displayName = (decoded.name || emailNorm.split("@")[0] || "SimLab User").trim();
+
+    try {
+      return await db.transaction(async (tx) => {
+        // Check if an existing user with this email already exists so we link firebaseUid without losing their role
+        const existingByEmail = await tx
+          .select()
+          .from(users)
+          .where(sql`LOWER(${users.email}) = ${emailNorm}`)
+          .limit(1);
+
+        let userRow: typeof users.$inferSelect;
+
+        if (existingByEmail.length > 0) {
+          const [updated] = await tx
+            .update(users)
+            .set({
+              firebaseUid: uid,
+              lastLoginAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(eq(users.id, existingByEmail[0].id))
+            .returning();
+          userRow = updated;
+        } else {
+          // Concurrent-safe upsert keyed on firebaseUid
+          const placeholderHash = await this.hashPassword(crypto.randomBytes(24).toString("hex"));
+          const newId = `usr-fb-${crypto.randomUUID().slice(0, 12)}`;
+          const [upserted] = await tx
+            .insert(users)
+            .values({
+              id: newId,
+              firebaseUid: uid,
+              email: emailNorm,
+              passwordHash: placeholderHash,
+              name: displayName,
+              role: "student",
+              status: "ACTIVE",
+              institution: "National Institute of Science & Technology",
+              lastLoginAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .onConflictDoUpdate({
+              target: users.firebaseUid,
+              set: {
+                email: emailNorm,
+                name: displayName,
+                lastLoginAt: new Date(),
+                updatedAt: new Date(),
+              },
+            })
+            .returning();
+          userRow = upserted;
+        }
+
+        if (userRow.status !== "ACTIVE") {
+          throw new Error(
+            `Your account has been ${userRow.status.toLowerCase()}. Please contact your institution administrator.`
+          );
+        }
+
+        const sessionId = `ses-${crypto.randomUUID()}`;
+        const token = this.generateToken({
+          userId: userRow.id,
+          email: userRow.email,
+          role: userRow.role as UserRole,
+          name: userRow.name,
+          sessionId,
+        });
+        const refreshToken = this.generateRefreshToken();
+        const expiresAt = new Date(Date.now() + this.jwtRefreshExpiryDays * 24 * 60 * 60 * 1000);
+
+        await tx.insert(sessions).values({
+          id: sessionId,
+          userId: userRow.id,
+          tokenHash: this.hashToken(token),
+          refreshTokenHash: this.hashToken(refreshToken),
+          userAgent: clientInfo?.userAgent || null,
+          ipAddress: clientInfo?.ipAddress || null,
+          expiresAt,
+          status: "ACTIVE",
+          isRevoked: false,
+        });
+
+        await tx.insert(authEvents).values({
+          id: `evt-${crypto.randomUUID()}`,
+          userId: userRow.id,
+          eventType: "FIREBASE_LOGIN_SUCCESS",
+          success: true,
+          sessionId,
+          ipAddress: clientInfo?.ipAddress || null,
+          userAgent: clientInfo?.userAgent || null,
+          metadata: { provider: "google.com", role: userRow.role },
+        });
+
+        const safeUser: SafeUser = {
+          id: userRow.id,
+          firebase_uid: userRow.firebaseUid,
+          email: userRow.email,
+          name: userRow.name,
+          role: userRow.role as UserRole,
+          status: userRow.status as UserStatus,
+          institution: userRow.institution,
+          enrollment_code: userRow.enrollmentCode || undefined,
+          last_login_at: userRow.lastLoginAt?.toISOString() || null,
+          created_at: userRow.createdAt.toISOString(),
+          updated_at: userRow.updatedAt.toISOString(),
+        };
+
+        return {
+          user: safeUser,
+          token,
+          refreshToken,
+          session: {
+            id: sessionId,
+            expiresAt: expiresAt.toISOString(),
+          },
+        };
+      });
+    } catch (error: any) {
+      if (error?.message?.includes("suspended") || error?.message?.includes("disabled")) {
+        throw error;
+      }
+      console.error("[AuthService] Firebase authentication failed:", error);
+      throw new Error("Failed to authenticate with Google account.", { cause: error });
+    }
+  }
+
+  /**
    * Register a new user account with bcrypt hashing and immediate audit event
    */
   public async register(
@@ -491,14 +400,18 @@ class AuthService {
   ): Promise<AuthResult> {
     const emailNorm = data.email.trim().toLowerCase();
 
-    // 1. Role Escalation Guard: Only "student" or "teacher" can self-register
     if (data.role !== "student" && data.role !== "teacher") {
       throw new Error("Invalid role specified. Only 'student' and 'teacher' accounts may be registered.");
     }
 
+    // For student registrations, require a class selection (e.g. PHY101-A or SCI204-B)
+    const classValidation = validateRegistrationClassSelection(data.role, data.classId);
+    if (!classValidation.valid) {
+      throw new Error(`INVALID_CLASS: ${classValidation.error}`);
+    }
+
     const client = await this.getClient();
     try {
-      // 2. Check for duplicate account
       const existingRes = await client.query(
         "SELECT id FROM users WHERE LOWER(email) = $1 LIMIT 1;",
         [emailNorm]
@@ -507,7 +420,6 @@ class AuthService {
         throw new Error("An account with this email address already exists.");
       }
 
-      // 3. Hash password with bcrypt
       const passwordHash = await this.hashPassword(data.password);
       const userId = `usr-${crypto.randomUUID()}`;
       const now = new Date().toISOString();
@@ -546,7 +458,20 @@ class AuthService {
         ]
       );
 
-      // 4. Create active session & token pair
+      // Atomically enroll student in selected class & notify the assigned faculty member
+      let enrollmentOutcome: EnrollmentOutcome | undefined;
+      if (newUser.role === "student") {
+        enrollmentOutcome = await enrollStudentInClassWithinTransaction(client, {
+          student: {
+            id: newUser.id,
+            name: newUser.name,
+            email: newUser.email,
+            enrollmentCode: newUser.enrollment_code || null,
+          },
+          classIdOrCode: classValidation.normalizedClassSelector,
+        });
+      }
+
       const sessionId = `ses-${crypto.randomUUID()}`;
       const token = this.generateToken({
         userId: newUser.id,
@@ -559,7 +484,6 @@ class AuthService {
 
       const tokenHash = this.hashToken(token);
       const refreshTokenHash = this.hashToken(refreshToken);
-
       const expiresAt = new Date(Date.now() + this.jwtRefreshExpiryDays * 24 * 60 * 60 * 1000);
 
       await client.query(
@@ -576,7 +500,6 @@ class AuthService {
         ]
       );
 
-      // 5. Audit Event
       await this.recordAuthEvent(
         {
           user_id: newUser.id,
@@ -585,7 +508,18 @@ class AuthService {
           session_id: sessionId,
           ip_address: clientInfo?.ipAddress,
           user_agent: clientInfo?.userAgent,
-          metadata: { role: newUser.role, institution: newUser.institution },
+          metadata: {
+            role: newUser.role,
+            institution: newUser.institution,
+            ...(enrollmentOutcome
+              ? {
+                  enrollmentId: enrollmentOutcome.enrollmentId,
+                  classId: enrollmentOutcome.classId,
+                  classCode: enrollmentOutcome.classCode,
+                  facultyId: enrollmentOutcome.facultyId,
+                }
+              : {}),
+          },
         },
         client
       );
@@ -600,6 +534,7 @@ class AuthService {
           id: sessionId,
           expiresAt: expiresAt.toISOString(),
         },
+        enrollment: enrollmentOutcome,
       };
     } catch (err) {
       await client.query("ROLLBACK;").catch(() => {});
@@ -611,14 +546,12 @@ class AuthService {
 
   /**
    * Authenticate user credentials with transaction, bcrypt verification, session persistence, and audit logging
-   * (Requirements 9, 10, 11, 18, 23)
    */
   public async login(data: LoginDTO): Promise<AuthResult> {
     const emailNorm = data.email.trim().toLowerCase();
     const client = await this.getClient();
 
     try {
-      // 1. Fetch user by email
       const userRes = await client.query(
         "SELECT * FROM users WHERE LOWER(email) = $1 LIMIT 1;",
         [emailNorm]
@@ -626,7 +559,6 @@ class AuthService {
       const user = userRes.rows[0] as UserRecord | undefined;
 
       if (!user) {
-        // Record failed login audit event without leaking user existence
         await this.recordAuthEvent({
           user_id: null,
           event_type: "LOGIN_FAILURE",
@@ -638,7 +570,6 @@ class AuthService {
         throw new Error("Invalid email or password.");
       }
 
-      // 2. Enforce Account Status (Requirement 18)
       if (user.status === "SUSPENDED" || user.status === "DISABLED") {
         await this.recordAuthEvent({
           user_id: user.id,
@@ -648,10 +579,11 @@ class AuthService {
           user_agent: data.userAgent,
           metadata: { status: user.status },
         });
-        throw new Error(`Your account has been ${user.status.toLowerCase()}. Please contact your institution administrator.`);
+        throw new Error(
+          `Your account has been ${user.status.toLowerCase()}. Please contact your institution administrator.`
+        );
       }
 
-      // 3. Verify bcrypt password hash
       const isPasswordValid = await this.comparePassword(data.password, user.password_hash);
       if (!isPasswordValid) {
         await this.recordAuthEvent({
@@ -665,15 +597,12 @@ class AuthService {
         throw new Error("Invalid email or password.");
       }
 
-      // 4. Role mismatch check if specified
       if (data.role && user.role.toLowerCase() !== data.role.toLowerCase()) {
         throw new Error(
           `This account is registered as a ${user.role}. Please switch your sign-in role to ${user.role}.`
         );
       }
 
-      // 5. Transactional Login Persistence (Requirements 9, 11, 23)
-      // Transactions ensure: session record, LOGIN_SUCCESS audit event, and users.last_login_at are atomic
       await client.query("BEGIN;");
 
       const sessionId = `ses-${crypto.randomUUID()}`;
@@ -690,7 +619,6 @@ class AuthService {
       const refreshTokenHash = this.hashToken(refreshToken);
       const expiresAt = new Date(Date.now() + this.jwtRefreshExpiryDays * 24 * 60 * 60 * 1000);
 
-      // Persist session
       await client.query(
         `INSERT INTO sessions (id, user_id, token_hash, refresh_token_hash, user_agent, ip_address, expires_at, created_at, last_activity_at, status, is_revoked)
          VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW(), 'ACTIVE', FALSE);`,
@@ -705,13 +633,11 @@ class AuthService {
         ]
       );
 
-      // Update users.last_login_at
       await client.query(
         "UPDATE users SET last_login_at = NOW(), updated_at = NOW() WHERE id = $1;",
         [user.id]
       );
 
-      // Record LOGIN_SUCCESS audit event
       await this.recordAuthEvent(
         {
           user_id: user.id,
@@ -727,7 +653,6 @@ class AuthService {
 
       await client.query("COMMIT;");
 
-      // Update local memory representation of last_login_at
       user.last_login_at = new Date().toISOString();
 
       return {
@@ -757,7 +682,6 @@ class AuthService {
       return { valid: false, error: "Missing authorization token." };
     }
 
-    // 1. Verify JWT signature and payload
     const payload = this.verifyToken(token);
     if (!payload) {
       return { valid: false, error: "Invalid or expired token." };
@@ -767,14 +691,13 @@ class AuthService {
     const client = await this.getClient();
 
     try {
-      // 2. Query session by ID or token hash
       const sessionRes = await client.query(
-        `SELECT * FROM sessions WHERE id = $1 OR token_hash = $2 LIMIT 1;`,
+        `SELECT * FROM sessions WHERE id = $1 AND token_hash = $2 LIMIT 1;`,
         [payload.sessionId, tokenHash]
       );
 
       if (sessionRes.rows.length === 0) {
-        return { valid: false, error: "Session not found." };
+        return { valid: false, error: "Session not found or token rotated." };
       }
 
       const session = sessionRes.rows[0] as SessionRecord;
@@ -787,7 +710,6 @@ class AuthService {
         return { valid: false, error: "Session has expired. Please sign in again." };
       }
 
-      // 3. Verify user status
       const userRes = await client.query("SELECT * FROM users WHERE id = $1 LIMIT 1;", [
         session.user_id,
       ]);
@@ -800,7 +722,6 @@ class AuthService {
         return { valid: false, error: `Account is ${user.status.toLowerCase()}. Access denied.` };
       }
 
-      // Touch last_activity_at periodically
       client.query("UPDATE sessions SET last_activity_at = NOW() WHERE id = $1;", [session.id]).catch(() => {});
 
       return {
@@ -815,7 +736,7 @@ class AuthService {
   }
 
   /**
-   * Refresh Token Endpoint with Token Rotation and Reuse Detection (Requirements 14, 15, 16)
+   * Refresh Token Endpoint with Token Rotation and Reuse Detection
    */
   public async refresh(
     refreshToken: string,
@@ -829,14 +750,12 @@ class AuthService {
     const client = await this.getClient();
 
     try {
-      // Query session matching refresh_token_hash
       const sessionRes = await client.query(
         "SELECT * FROM sessions WHERE refresh_token_hash = $1 LIMIT 1;",
         [refreshHash]
       );
 
       if (sessionRes.rows.length === 0) {
-        // Potential refresh token replay/reuse anomaly: invalidate session or reject
         await this.recordAuthEvent({
           event_type: "TOKEN_REFRESH_REUSE_DETECTED",
           success: false,
@@ -849,7 +768,6 @@ class AuthService {
 
       const session = sessionRes.rows[0] as SessionRecord;
 
-      // Detect reuse of revoked session
       if (session.is_revoked || session.status !== "ACTIVE") {
         await this.recordAuthEvent(
           {
@@ -871,7 +789,6 @@ class AuthService {
         throw new Error("Refresh token has expired. Please sign in again.");
       }
 
-      // Fetch user
       const userRes = await client.query("SELECT * FROM users WHERE id = $1 LIMIT 1;", [
         session.user_id,
       ]);
@@ -884,7 +801,6 @@ class AuthService {
         throw new Error(`User account is ${user.status.toLowerCase()}.`);
       }
 
-      // Rotate: generate new access token AND new rotated refresh token
       const newAccessToken = this.generateToken({
         userId: user.id,
         email: user.email,
@@ -938,7 +854,7 @@ class AuthService {
   }
 
   /**
-   * Revoke session on logout and record LOGOUT audit event (Requirements 16 & 17)
+   * Revoke session on logout and record LOGOUT audit event
    */
   public async revokeSession(
     tokenOrSessionId: string,
@@ -981,7 +897,7 @@ class AuthService {
   }
 
   /**
-   * Revoke all active sessions for a user (Requirement 33)
+   * Revoke all active sessions for a user
    */
   public async revokeAllSessions(
     userId: string,
@@ -1019,7 +935,7 @@ class AuthService {
   }
 
   /**
-   * Change user password securely with verification, hashing, and audit (Requirement 19)
+   * Change user password securely with verification, hashing, and audit
    */
   public async changePassword(
     userId: string,
@@ -1085,7 +1001,7 @@ class AuthService {
   }
 
   /**
-   * Request password reset token (Requirement 20)
+   * Request password reset token
    */
   public async requestPasswordReset(
     email: string,
@@ -1108,7 +1024,7 @@ class AuthService {
       const userId = userRes.rows[0].id;
       const resetToken = `rst_${crypto.randomBytes(32).toString("hex")}`;
       const tokenHash = this.hashToken(resetToken);
-      const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
 
       await client.query("BEGIN;");
 
@@ -1141,7 +1057,7 @@ class AuthService {
   }
 
   /**
-   * Complete password reset using token (Requirement 20)
+   * Complete password reset using token
    */
   public async resetPassword(
     token: string,
@@ -1174,18 +1090,15 @@ class AuthService {
 
       await client.query("BEGIN;");
 
-      // Update password
       await client.query(
         "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2;",
         [newHash, resetRecord.user_id]
       );
 
-      // Mark reset token used
       await client.query("UPDATE password_resets SET used_at = NOW() WHERE id = $1;", [
         resetRecord.id,
       ]);
 
-      // Revoke all active sessions upon password reset
       await client.query(
         "UPDATE sessions SET is_revoked = TRUE, status = 'REVOKED', revoked_at = NOW() WHERE user_id = $1;",
         [resetRecord.user_id]
@@ -1212,7 +1125,7 @@ class AuthService {
   }
 
   /**
-   * Retrieve safe audit sessions for the authenticated user (Requirement 32)
+   * Retrieve safe audit sessions for the authenticated user
    */
   public async getUserSessions(userId: string, currentSessionId?: string): Promise<any[]> {
     const client = await this.getClient();
@@ -1241,9 +1154,6 @@ class AuthService {
     }
   }
 
-  /**
-   * Find user by ID
-   */
   public async findUserById(id: string): Promise<UserRecord | null> {
     const client = await this.getClient();
     try {
@@ -1254,9 +1164,6 @@ class AuthService {
     }
   }
 
-  /**
-   * Find user by email
-   */
   public async findUserByEmail(email: string): Promise<UserRecord | null> {
     const client = await this.getClient();
     try {
@@ -1269,16 +1176,10 @@ class AuthService {
     }
   }
 
-  /**
-   * Expose pool for direct SQL verification queries in integration tests
-   */
-  public getPool(): Pool | null {
+  public getPool(): Pool {
     return this.pool;
   }
 
-  /**
-   * Sanitize user record to omit password hash
-   */
   public toSafeUser(user: UserRecord): SafeUser {
     const { password_hash, ...safe } = user;
     return safe;

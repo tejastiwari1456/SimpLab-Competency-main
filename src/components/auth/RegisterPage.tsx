@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   FlaskConical,
   GraduationCap,
@@ -15,9 +15,10 @@ import {
   CheckCircle2,
   ArrowLeft,
   Check,
+  BookOpen,
 } from 'lucide-react';
 import { motion } from 'motion/react';
-import { UserRole, CurrentUser } from '../../types';
+import { UserRole, CurrentUser, AvailableClassOption } from '../../types';
 import { useAuth } from '../../context/AuthContext';
 
 interface RegisterPageProps {
@@ -39,10 +40,48 @@ export const RegisterPage: React.FC<RegisterPageProps> = ({
   const [confirmPassword, setConfirmPassword] = useState<string>('');
   const [institution, setInstitution] = useState<string>('');
   const [enrollmentCode, setEnrollmentCode] = useState<string>('');
+  const [selectedClassId, setSelectedClassId] = useState<string>('');
+  const [availableClasses, setAvailableClasses] = useState<AvailableClassOption[]>([]);
+  const [classesLoading, setClassesLoading] = useState<boolean>(true);
+  const [classesError, setClassesError] = useState<string>('');
   const [showPassword, setShowPassword] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+
+  // Dynamically load active classes from PostgreSQL (e.g., PHY101-A, SCI204-B)
+  useEffect(() => {
+    let cancelled = false;
+    setClassesLoading(true);
+    setClassesError('');
+
+    fetch('/api/classes/available')
+      .then(async (res) => {
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !Array.isArray(data.classes)) {
+          throw new Error(data.error || 'Unable to load available class cohorts.');
+        }
+        if (!cancelled) {
+          setAvailableClasses(data.classes);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setClassesError(
+            err instanceof Error ? err.message : 'Unable to load available class cohorts.'
+          );
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setClassesLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const selectedClassObj = availableClasses.find((c) => c.id === selectedClassId) || null;
 
   // Password validation criteria
   const isLengthValid = password.length >= 6;
@@ -61,6 +100,11 @@ export const RegisterPage: React.FC<RegisterPageProps> = ({
 
     if (!email.trim() || !email.includes('@')) {
       setErrorMessage('Please provide a valid institutional or personal email address.');
+      return;
+    }
+
+    if (role === 'student' && !selectedClassId) {
+      setErrorMessage('Please select the class cohort you are enrolling in (e.g., PHY101-A or SCI204-B).');
       return;
     }
 
@@ -84,6 +128,7 @@ export const RegisterPage: React.FC<RegisterPageProps> = ({
         role,
         institution: institution.trim(),
         enrollmentCode: enrollmentCode.trim() || undefined,
+        classId: role === 'student' ? selectedClassId : undefined,
       });
 
       if (!result.success || !result.user || !result.token) {
@@ -94,7 +139,11 @@ export const RegisterPage: React.FC<RegisterPageProps> = ({
 
       // Synchronize session token and user state immediately
       setSession(result.user, result.token);
-      setSuccessMessage(`Account created successfully! Welcome, ${result.user.name}.`);
+      setSuccessMessage(
+        role === 'student' && selectedClassObj
+          ? `Account created & enrolled in ${selectedClassObj.code}! Welcome, ${result.user.name}.`
+          : `Account created successfully! Welcome, ${result.user.name}.`
+      );
 
       setTimeout(() => {
         onRegisterSuccess(result.user!, result.token!);
@@ -123,7 +172,7 @@ export const RegisterPage: React.FC<RegisterPageProps> = ({
             className="inline-flex items-center gap-1.5 text-xs font-semibold text-stone-600 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-100 transition-colors"
           >
             <ArrowLeft className="h-3.5 w-3.5" />
-            <span>Return to Virtual Lab</span>
+            <span>Back to SimLab Overview</span>
           </button>
         </div>
 
@@ -349,7 +398,73 @@ export const RegisterPage: React.FC<RegisterPageProps> = ({
               </div>
             </div>
 
-            {/* Institution & Code Row */}
+            {/* Student Class Cohort Selection (Dynamically loaded from PostgreSQL) */}
+            {role === 'student' && (
+              <div>
+                <label
+                  htmlFor="register-class-select"
+                  className="block text-xs font-semibold text-stone-700 dark:text-stone-300 mb-1"
+                >
+                  Select Class / Cohort to Enroll <span className="text-amber-600">*</span>
+                </label>
+                <div className="relative">
+                  <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3 text-stone-400">
+                    <BookOpen className="h-4 w-4" />
+                  </div>
+                  <select
+                    id="register-class-select"
+                    required
+                    value={selectedClassId}
+                    onChange={(e) => setSelectedClassId(e.target.value)}
+                    disabled={classesLoading}
+                    className="w-full rounded-xl border border-stone-300 dark:border-stone-700 bg-white dark:bg-stone-800/90 pl-9 pr-3 py-2 text-xs sm:text-sm text-stone-900 dark:text-stone-100 focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-500/20 transition-all"
+                  >
+                    <option value="">
+                      {classesLoading
+                        ? 'Loading available classes...'
+                        : 'Choose your class cohort (e.g., PHY101-A or SCI204-B)'}
+                    </option>
+                    {availableClasses.map((cls) => (
+                      <option key={cls.id} value={cls.id}>
+                        {cls.code} — {cls.name}
+                        {cls.facultyName ? ` (${cls.facultyName})` : ' (Faculty Pending)'}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {classesError && (
+                  <p className="mt-1 text-[11px] text-rose-600 dark:text-rose-400">
+                    {classesError}
+                  </p>
+                )}
+
+                {selectedClassObj && (
+                  <div className="mt-2 rounded-xl border border-amber-200/80 dark:border-amber-800/50 bg-amber-50/50 dark:bg-amber-950/20 px-3 py-2 text-[11px] text-stone-700 dark:text-stone-300 flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <span className="font-bold text-amber-800 dark:text-amber-300">
+                        {selectedClassObj.code}
+                      </span>{' '}
+                      • {selectedClassObj.semester} ({selectedClassObj.academicYear})
+                    </div>
+                    <div className="font-medium">
+                      Faculty:{' '}
+                      <span
+                        className={
+                          selectedClassObj.hasAssignedFaculty
+                            ? 'font-bold text-stone-900 dark:text-stone-100'
+                            : 'font-bold text-rose-600 dark:text-rose-400'
+                        }
+                      >
+                        {selectedClassObj.facultyName || 'Not yet assigned'}
+                      </span>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Institution & Student ID / Faculty Code Row */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
                 <label
@@ -367,7 +482,7 @@ export const RegisterPage: React.FC<RegisterPageProps> = ({
                     type="text"
                     value={institution}
                     onChange={(e) => setInstitution(e.target.value)}
-                    placeholder="e.g. Department of Physics"
+                    placeholder="e.g. National Institute of Science"
                     className="w-full rounded-xl border border-stone-300 dark:border-stone-700 bg-white dark:bg-stone-800/90 pl-9 pr-3 py-2 text-xs sm:text-sm text-stone-900 dark:text-stone-100 placeholder-stone-400 focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-500/20 transition-all"
                   />
                 </div>
@@ -378,7 +493,7 @@ export const RegisterPage: React.FC<RegisterPageProps> = ({
                   htmlFor="register-enrollment-code"
                   className="block text-xs font-semibold text-stone-700 dark:text-stone-300 mb-1"
                 >
-                  {role === 'student' ? 'Class / Course Code' : 'Faculty Passcode'}
+                  {role === 'student' ? 'Student ID / Reg. Number' : 'Faculty Passcode'}
                 </label>
                 <div className="relative">
                   <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3 text-stone-400">
@@ -389,7 +504,7 @@ export const RegisterPage: React.FC<RegisterPageProps> = ({
                     type="text"
                     value={enrollmentCode}
                     onChange={(e) => setEnrollmentCode(e.target.value)}
-                    placeholder={role === 'student' ? 'e.g. PHYS-101 (Optional)' : 'e.g. DEPT-FACULTY'}
+                    placeholder={role === 'student' ? 'e.g. PHYS-2026-109 (Optional)' : 'e.g. DEPT-FACULTY'}
                     className="w-full rounded-xl border border-stone-300 dark:border-stone-700 bg-white dark:bg-stone-800/90 pl-9 pr-3 py-2 text-xs sm:text-sm text-stone-900 dark:text-stone-100 placeholder-stone-400 focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-500/20 transition-all"
                   />
                 </div>

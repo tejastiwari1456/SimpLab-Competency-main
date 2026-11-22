@@ -1,69 +1,55 @@
 import React, { useState } from 'react';
 import {
-  TrendingUp,
   Award,
-  CheckCircle2,
-  ShieldCheck,
-  Clock,
-  BookOpen,
-  Sparkles,
   Filter,
   ArrowRight,
-  Sliders,
   Target,
-  FlaskConical,
-  Zap,
+  Sparkles,
+  Eye,
 } from 'lucide-react';
 import {
   CompetencyKey,
-  COMPETENCY_DIMENSIONS,
   StudentSubmission,
   CurrentUser,
   StudentMilestoneStatus,
-  CompetencyMilestone,
+  StudentCompetencyReport,
+  VivaSessionRecord,
 } from '../../types';
+import { EXPERIMENTS } from '../../data/mockData';
 import {
   COMPETENCY_MILESTONES,
   getMilestoneStatuses,
-  calculateOverallMastery,
-  detectNewlyUnlockedMilestones,
 } from '../../data/milestonesData';
 import { DigitalBadgeCard } from '../badges/DigitalBadgeCard';
 import { DigitalBadgeModal } from '../badges/DigitalBadgeModal';
-import { MilestoneCelebrationModal } from '../badges/MilestoneCelebrationModal';
+import { SubmissionDetailModal } from './AssessmentDetailModals';
 
 interface StudentProgressViewProps {
+  token?: string | null;
   competencyScores: Record<CompetencyKey, number>;
+  competencyReport?: StudentCompetencyReport | null;
   submissions: StudentSubmission[];
-  currentUser?: CurrentUser;
+  vivaSessions?: VivaSessionRecord[];
+  currentUser: CurrentUser;
   onPractice?: (experimentId: string) => void;
-  onTaskCompleted?: (taskId: string, score: number, competency: CompetencyKey) => void;
 }
 
 export const StudentProgressView: React.FC<StudentProgressViewProps> = ({
+  token = null,
   competencyScores,
   submissions,
+  vivaSessions = [],
   currentUser,
   onPractice,
-  onTaskCompleted,
 }) => {
-  const studentName = currentUser?.name || 'Aarav Sharma';
-  const enrollmentCode = currentUser?.enrollmentCode || 'STU-2026-081';
-  const institution = currentUser?.institution || 'Delhi University • Faculty of Science';
+  const studentName = currentUser.name;
+  const enrollmentCode = currentUser.enrollmentCode || currentUser.id.slice(0, 12);
+  const institution = currentUser.institution || 'Not specified';
 
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
   const [activeModalStatus, setActiveModalStatus] = useState<StudentMilestoneStatus | null>(null);
-  const [celebratedMilestone, setCelebratedMilestone] = useState<{
-    milestone: CompetencyMilestone;
-    score: number;
-  } | null>(null);
+  const [selectedSubmission, setSelectedSubmission] = useState<StudentSubmission | null>(null);
 
-  // Quick Calibration simulation state for reaching 90 in measurement precision
-  const [calibrationInput, setCalibrationInput] = useState<string>('15.40');
-  const [calibrationFeedback, setCalibrationFeedback] = useState<string | null>(null);
-  const [isCalibrating, setIsCalibrating] = useState<boolean>(false);
-
-  // Compute live milestone statuses
   const milestoneStatuses = getMilestoneStatuses(
     COMPETENCY_MILESTONES,
     competencyScores,
@@ -74,15 +60,11 @@ export const StudentProgressView: React.FC<StudentProgressViewProps> = ({
   const unlockedCount = milestoneStatuses.filter((s) => s.isUnlocked).length;
   const totalCount = milestoneStatuses.length;
   const goldCount = milestoneStatuses.filter((s) => s.isUnlocked && s.milestone.tier === 'gold').length;
-  const overallMastery = calculateOverallMastery(competencyScores);
 
-  // Find the nearest locked milestone
-  const lockedMilestones = milestoneStatuses
+  const nearestMilestone = milestoneStatuses
     .filter((s) => !s.isUnlocked)
-    .sort((a, b) => a.pointsNeeded - b.pointsNeeded);
-  const nearestMilestone = lockedMilestones[0];
+    .sort((a, b) => a.pointsNeeded - b.pointsNeeded)[0];
 
-  // Filtered milestones
   const filteredMilestones = milestoneStatuses.filter((s) => {
     if (selectedCategory === 'all') return true;
     if (selectedCategory === 'unlocked') return s.isUnlocked;
@@ -95,39 +77,6 @@ export const StudentProgressView: React.FC<StudentProgressViewProps> = ({
     if (selectedCategory === 'design') return s.milestone.competencyKey === 'experimental_design';
     return true;
   });
-
-  // Handle direct calibration task (e.g. hitting 90 in measurement precision)
-  const handlePerformCalibrationTrial = () => {
-    setIsCalibrating(true);
-    setTimeout(() => {
-      setIsCalibrating(false);
-      const prevScores = { ...competencyScores };
-      const currentPrecision = competencyScores.measurement_precision || 88;
-      const targetScore = Math.min(99, Math.max(90, currentPrecision + 2));
-
-      // Trigger task completion callback
-      if (onTaskCompleted) {
-        onTaskCompleted('calib-precision-trial', 10, 'measurement_precision');
-      }
-
-      setCalibrationFeedback(
-        `Zero-error offset eliminated! Measurement Precision boosted to ${targetScore}%.`
-      );
-
-      // Check if this unlocked the milestone (specifically milestone-prec-90)
-      const nextScores = {
-        ...prevScores,
-        measurement_precision: targetScore,
-      };
-      const newlyUnlocked = detectNewlyUnlockedMilestones(prevScores, nextScores);
-      if (newlyUnlocked.length > 0) {
-        setCelebratedMilestone({
-          milestone: newlyUnlocked[0],
-          score: targetScore,
-        });
-      }
-    }, 600);
-  };
 
   return (
     <div id="student-progress-view" className="space-y-6">
@@ -147,11 +96,10 @@ export const StudentProgressView: React.FC<StudentProgressViewProps> = ({
             Competency Milestones & Digital Badges
           </h1>
           <p className="mt-1 text-xs text-stone-600 dark:text-stone-300 max-w-2xl leading-relaxed">
-            Digital badges are automatically awarded when your verified practical scores cross strict competency thresholds. Earn accredited micro-credentials for measurement precision, apparatus setup, and viva defense.
+            Digital badges unlock automatically once your server-verified experiment submissions and AI Viva scores cross syllabus competency thresholds.
           </p>
         </div>
 
-        {/* Milestone Achievement Stats */}
         <div className="flex items-center gap-3 shrink-0">
           <div className="rounded-xl border border-stone-200 dark:border-stone-800 bg-stone-50 dark:bg-stone-850 px-4 py-3 text-center min-w-[110px]">
             <span className="block text-[10px] uppercase font-bold text-stone-500 dark:text-stone-400">
@@ -176,68 +124,48 @@ export const StudentProgressView: React.FC<StudentProgressViewProps> = ({
         </div>
       </div>
 
-      {/* 2. Interactive Focus Card: Measurement Precision Threshold Tracker (e.g. Reaching 90) */}
-      <div className="rounded-2xl border border-stone-200 dark:border-stone-800 bg-gradient-to-r from-amber-500/10 via-amber-500/5 to-transparent dark:from-amber-950/40 dark:via-amber-950/20 p-5 shadow-xs">
-        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-5">
-          <div className="space-y-1.5 max-w-xl">
-            <div className="flex items-center gap-2">
-              <span className="rounded bg-amber-200 dark:bg-amber-900/80 px-2 py-0.5 text-[10px] font-bold text-amber-900 dark:text-amber-200 uppercase tracking-wider">
-                Target Milestone in Reach
-              </span>
-              <span className="text-xs font-mono font-bold text-stone-500 dark:text-stone-400">
-                Threshold: 90% in Measurement Precision
-              </span>
-            </div>
-            <h3 className="text-base font-bold text-stone-900 dark:text-stone-100 flex items-center gap-2">
-              <Target className="h-4 w-4 text-amber-500" />
-              <span>Precision Metrology Master (Gold Tier)</span>
-            </h3>
-            <p className="text-xs text-stone-600 dark:text-stone-300 leading-relaxed">
-              Your current Measurement Precision is{' '}
-              <strong className="font-mono font-bold text-stone-900 dark:text-stone-100">
-                {competencyScores.measurement_precision || 88}%
-              </strong>
-              . Complete a zero-error calibration trial or optical bench run to hit the 90% threshold and unlock the Gold digital badge.
-            </p>
-
-            {calibrationFeedback && (
-              <div className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-100 dark:bg-emerald-950/80 px-3 py-1 text-xs font-bold text-emerald-800 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-800">
-                <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
-                <span>{calibrationFeedback}</span>
+      {/* 2. Next Target Milestone Tracker */}
+      {nearestMilestone && (
+        <div className="rounded-2xl border border-stone-200 dark:border-stone-800 bg-gradient-to-r from-amber-500/10 via-amber-500/5 to-transparent dark:from-amber-950/40 dark:via-amber-950/20 p-5 shadow-xs">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-5">
+            <div className="space-y-1.5 max-w-xl">
+              <div className="flex items-center gap-2">
+                <span className="rounded bg-amber-200 dark:bg-amber-900/80 px-2 py-0.5 text-[10px] font-bold text-amber-900 dark:text-amber-200 uppercase tracking-wider">
+                  Next Milestone Target
+                </span>
+                <span className="text-xs font-mono font-bold text-stone-500 dark:text-stone-400">
+                  Threshold: {nearestMilestone.threshold}%
+                </span>
               </div>
+              <h3 className="text-base font-bold text-stone-900 dark:text-stone-100 flex items-center gap-2">
+                <Target className="h-4 w-4 text-amber-500" />
+                <span>{nearestMilestone.milestone.title}</span>
+              </h3>
+              <p className="text-xs text-stone-600 dark:text-stone-300 leading-relaxed">
+                Current verified score:{' '}
+                <strong className="font-mono font-bold text-stone-900 dark:text-stone-100">
+                  {nearestMilestone.currentScore}%
+                </strong>{' '}
+                ({nearestMilestone.pointsNeeded}% more required). Complete and submit an assigned laboratory experiment to update your official competency record.
+              </p>
+            </div>
+
+            {onPractice && (
+              <button
+                type="button"
+                onClick={() =>
+                  onPractice(nearestMilestone.milestone.recommendedExperimentId || 'exp-convex-lens')
+                }
+                className="flex items-center justify-center gap-1.5 rounded-xl bg-stone-900 dark:bg-amber-500 px-4 py-2.5 text-xs font-bold text-white dark:text-stone-950 shadow-xs hover:bg-stone-800 dark:hover:bg-amber-400 transition-all cursor-pointer shrink-0"
+              >
+                <Sparkles className="h-3.5 w-3.5 text-amber-400 dark:text-stone-950" />
+                <span>Launch Recommended Lab</span>
+                <ArrowRight className="h-3.5 w-3.5" />
+              </button>
             )}
           </div>
-
-          {/* Quick Simulation / Calibration Action */}
-          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 shrink-0">
-            <div className="rounded-xl border border-stone-200 dark:border-stone-800 bg-white dark:bg-stone-900 p-3 flex items-center gap-2.5">
-              <Sliders className="h-4 w-4 text-amber-500" />
-              <div className="text-left">
-                <span className="block text-[10px] text-stone-400 uppercase font-bold">
-                  Zero Offset Check
-                </span>
-                <span className="font-mono font-bold text-xs text-stone-800 dark:text-stone-200">
-                  Δx = ±0.02 mm
-                </span>
-              </div>
-            </div>
-
-            <button
-              type="button"
-              disabled={isCalibrating}
-              onClick={handlePerformCalibrationTrial}
-              className="flex items-center justify-center gap-1.5 rounded-xl bg-stone-900 dark:bg-amber-500 px-4 py-2.5 text-xs font-bold text-white dark:text-stone-950 shadow-xs hover:bg-stone-800 dark:hover:bg-amber-400 disabled:opacity-50 transition-all cursor-pointer"
-            >
-              <Sparkles className="h-3.5 w-3.5 text-amber-400 dark:text-stone-950" />
-              <span>
-                {competencyScores.measurement_precision >= 90
-                  ? 'Re-Calibrate Precision (90%+ Earned)'
-                  : 'Calibrate Bench & Reach 90%'}
-              </span>
-            </button>
-          </div>
         </div>
-      </div>
+      )}
 
       {/* 3. Category & Tier Filter Tabs */}
       <div className="flex items-center gap-2 overflow-x-auto pb-1">
@@ -285,17 +213,17 @@ export const StudentProgressView: React.FC<StudentProgressViewProps> = ({
 
       {/* 5. Verified Practical Assessment Log */}
       <div className="rounded-2xl border border-stone-200 dark:border-stone-800 bg-white dark:bg-stone-900 p-5 shadow-xs">
-        <div className="flex items-center justify-between mb-3 border-b border-stone-100 dark:border-stone-800 pb-2.5">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3 border-b border-stone-100 dark:border-stone-800 pb-2.5">
           <div>
             <h3 className="text-sm font-bold text-stone-900 dark:text-stone-100">
               Verified Practical Assessment Log
             </h3>
             <p className="text-[11px] text-stone-500 dark:text-stone-400">
-              All experiment scores directly feed continuous competency milestone evaluations.
+              All experiment submissions directly feed continuous competency milestone evaluations. Click any row to inspect details.
             </p>
           </div>
-          <span className="rounded-full bg-stone-100 dark:bg-stone-800 px-2.5 py-0.5 text-xs font-mono font-bold text-stone-700 dark:text-stone-300">
-            {submissions.length} verified submissions
+          <span className="rounded-full bg-stone-100 dark:bg-stone-800 px-2.5 py-0.5 text-xs font-mono font-bold text-stone-700 dark:text-stone-300 shrink-0">
+            {submissions.length} submissions • {vivaSessions.length} viva sessions
           </span>
         </div>
 
@@ -304,41 +232,66 @@ export const StudentProgressView: React.FC<StudentProgressViewProps> = ({
             <table className="w-full text-left text-xs">
               <thead className="border-b border-stone-100 dark:border-stone-800 text-stone-500 dark:text-stone-400 font-medium">
                 <tr>
-                  <th className="pb-2">Session ID</th>
                   <th className="pb-2">Experiment</th>
-                  <th className="pb-2">Score</th>
-                  <th className="pb-2">Readings Taken</th>
+                  <th className="pb-2">Attempt</th>
+                  <th className="pb-2">Official Score</th>
+                  <th className="pb-2">Evaluation Status</th>
                   <th className="pb-2">Submitted</th>
-                  <th className="pb-2 text-right">Accredited Evidence</th>
+                  <th className="pb-2">Feedback</th>
+                  <th className="pb-2 text-right">Details</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-stone-100 dark:divide-stone-800">
-                {submissions.map((sub) => (
-                  <tr key={sub.id} className="text-stone-800 dark:text-stone-200">
-                    <td className="py-2.5 font-mono text-[11px] text-stone-500">
-                      {sub.id.slice(0, 12)}
-                    </td>
-                    <td className="py-2.5 font-semibold">{sub.experimentId}</td>
-                    <td className="py-2.5">
-                      <span className="rounded bg-emerald-50 dark:bg-emerald-950/60 px-2 py-0.5 font-bold text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800">
-                        {sub.totalScore}%
-                      </span>
-                    </td>
-                    <td className="py-2.5">{sub.dataReadingsCount} data points</td>
-                    <td className="py-2.5 text-stone-500">
-                      {new Date(sub.submittedAt).toLocaleDateString()}
-                    </td>
-                    <td className="py-2.5 text-right font-mono text-[11px] text-emerald-600 dark:text-emerald-400 font-semibold">
-                      VERIFIED • SYLLABUS UNIT
-                    </td>
-                  </tr>
-                ))}
+                {submissions.map((sub) => {
+                  const exp = EXPERIMENTS.find((e) => e.id === sub.experimentId);
+                  const effectiveScore = sub.facultyScore ?? sub.totalScore;
+                  const pct = Math.round(
+                    (Number(effectiveScore) / Number(sub.maxScore || 100)) * 100
+                  );
+                  return (
+                    <tr
+                      key={sub.id}
+                      onClick={() => setSelectedSubmission(sub)}
+                      className="text-stone-800 dark:text-stone-200 hover:bg-stone-50 dark:hover:bg-stone-850/70 transition-colors cursor-pointer"
+                    >
+                      <td className="py-2.5 font-semibold">{exp?.title || sub.experimentId}</td>
+                      <td className="py-2.5 font-mono text-[11px]">#{sub.attemptNumber}</td>
+                      <td className="py-2.5">
+                        <span className="rounded bg-emerald-50 dark:bg-emerald-950/60 px-2 py-0.5 font-bold text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800">
+                          {pct}%
+                        </span>
+                      </td>
+                      <td className="py-2.5 capitalize text-[11px]">
+                        {(sub.evaluationStatus || 'auto_graded').replace(/_/g, ' ')}
+                      </td>
+                      <td className="py-2.5 text-stone-500">
+                        {new Date(sub.submittedAt).toLocaleDateString()}
+                      </td>
+                      <td className="py-2.5 text-[11px] text-stone-600 dark:text-stone-400 max-w-[200px] truncate">
+                        {sub.instructorFeedback || 'Auto-graded / pending comment'}
+                      </td>
+                      <td className="py-2.5 text-right">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setSelectedSubmission(sub);
+                          }}
+                          className="inline-flex items-center gap-1 rounded-md border border-stone-200 dark:border-stone-700 px-2 py-1 text-[11px] font-semibold text-amber-700 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/40 cursor-pointer"
+                        >
+                          <Eye className="h-3 w-3" />
+                          <span>Inspect</span>
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
         ) : (
           <p className="text-xs text-stone-500 dark:text-stone-400">
-            No lab submission records available.
+            No lab submission records available yet.
           </p>
         )}
       </div>
@@ -355,18 +308,12 @@ export const StudentProgressView: React.FC<StudentProgressViewProps> = ({
         />
       )}
 
-      {/* 7. Milestone Celebration Modal (When crossing thresholds like 90 in measurement precision) */}
-      {celebratedMilestone && (
-        <MilestoneCelebrationModal
-          milestone={celebratedMilestone.milestone}
-          newScore={celebratedMilestone.score}
-          onClose={() => setCelebratedMilestone(null)}
-          onViewBadge={(m) => {
-            const matched = milestoneStatuses.find((s) => s.milestone.id === m.id);
-            if (matched) {
-              setActiveModalStatus({ ...matched, isUnlocked: true });
-            }
-          }}
+      {/* 7. Submission Detail Modal */}
+      {selectedSubmission && (
+        <SubmissionDetailModal
+          submission={selectedSubmission}
+          token={token}
+          onClose={() => setSelectedSubmission(null)}
         />
       )}
     </div>

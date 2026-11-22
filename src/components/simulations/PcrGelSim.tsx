@@ -146,7 +146,14 @@ export const PcrGelSim: React.FC<PcrGelSimProps> = ({
         }
       }
       if (rs.gel) {
-        setLoadingDyeAdded(rs.gel.loadingDyeAdded);
+        if (typeof rs.gel.loadingDyeAdded === 'boolean') {
+          setLoadingDyeAdded({
+            ladder: true,
+            pos_ctrl: rs.gel.loadingDyeAdded,
+            neg_ctrl: rs.gel.loadingDyeAdded,
+            sample: rs.gel.loadingDyeAdded,
+          });
+        }
         if (rs.gel.gelRunning && !gelRunning) {
           setGelRunning(true);
         }

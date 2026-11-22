@@ -1,5 +1,7 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
-import { CurrentUser, UserRole, RegisterFormData, AuthResponse, ClassCourse} from '../types';
+import { signInWithPopup, signOut as firebaseSignOut } from 'firebase/auth';
+import { auth, googleAuthProvider } from '../lib/firebase';
+import { CurrentUser, UserRole, RegisterFormData, AuthResponse } from '../types';
 
 export interface AuthContextType {
   user: CurrentUser | null;
@@ -8,6 +10,7 @@ export interface AuthContextType {
   isAuthenticated: boolean;
   isLoading: boolean;
   login: (email: string, password: string, role?: string) => Promise<{ success: boolean; error?: string; user?: CurrentUser; token?: string }>;
+  loginWithGoogle: (role?: UserRole) => Promise<{ success: boolean; error?: string; user?: CurrentUser; token?: string }>;
   register: (data: RegisterFormData) => Promise<{ success: boolean; error?: string; user?: CurrentUser; token?: string }>;
   setSession: (user: CurrentUser, token: string) => void;
   logout: () => Promise<void>;
@@ -55,7 +58,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (response.ok) {
         const data = await response.json();
         if (data.success && data.user) {
-          // Normalize role consistently (e.g. STUDENT -> student)
           const normalizedUser: CurrentUser = {
             ...data.user,
             role: (data.user.role || 'student').toLowerCase() as UserRole,
@@ -63,7 +65,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           setUser(normalizedUser);
           setToken(savedToken);
         } else {
-          // Invalidate stale or revoked token
           if (typeof window !== 'undefined') {
             localStorage.removeItem(AUTH_TOKEN_KEY);
           }
@@ -71,7 +72,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           setToken(null);
         }
       } else {
-        // 401 or 403 response
         if (typeof window !== 'undefined') {
           localStorage.removeItem(AUTH_TOKEN_KEY);
         }
@@ -79,7 +79,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setToken(null);
       }
     } catch {
-      // Network error: clear unverified user to prevent unauthorized access
       setUser(null);
       setToken(null);
     } finally {
@@ -143,6 +142,51 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
+  const loginWithGoogle = async (roleParam?: UserRole) => {
+    try {
+      const credential = await signInWithPopup(auth, googleAuthProvider);
+      const idToken = await credential.user.getIdToken();
+
+      const res = await fetch('/api/auth/firebase', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          idToken,
+          role: roleParam === 'teacher' ? 'teacher' : 'student',
+        }),
+      });
+
+      const data: AuthResponse = await res.json();
+      if (!res.ok || !data.success || !data.user || !data.token) {
+        return {
+          success: false,
+          error: data.error || data.message || 'Google sign-in verification failed.',
+        };
+      }
+
+      const normalizedUser: CurrentUser = {
+        ...data.user,
+        role: (data.user.role || 'student').toLowerCase() as UserRole,
+      };
+
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(AUTH_TOKEN_KEY, data.token);
+      }
+      setToken(data.token);
+      setUser(normalizedUser);
+
+      return { success: true, user: normalizedUser, token: data.token };
+    } catch (err: any) {
+      if (err?.code === 'auth/popup-closed-by-user') {
+        return { success: false, error: 'Google sign-in popup was closed before completion.' };
+      }
+      return {
+        success: false,
+        error: err?.message || 'Google authentication failed. Please try email sign-in.',
+      };
+    }
+  };
+
   const register = async (formData: RegisterFormData) => {
     try {
       const res = await fetch('/api/auth/register', {
@@ -155,6 +199,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           role: (formData.role || 'student').toLowerCase(),
           institution: formData.institution?.trim() || undefined,
           enrollmentCode: formData.enrollmentCode?.trim() || undefined,
+          classId: formData.classId?.trim() || undefined,
         }),
       });
 
@@ -203,6 +248,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     }
 
+    firebaseSignOut(auth).catch(() => {});
+
     if (typeof window !== 'undefined') {
       localStorage.removeItem(AUTH_TOKEN_KEY);
     }
@@ -219,6 +266,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         isAuthenticated,
         isLoading,
         login,
+        loginWithGoogle,
         register,
         setSession,
         logout,

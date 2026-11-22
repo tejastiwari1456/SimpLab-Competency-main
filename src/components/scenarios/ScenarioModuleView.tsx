@@ -12,6 +12,7 @@ import {
   Loader2,
 } from 'lucide-react';
 import { ScenarioModule, CompetencyKey, COMPETENCY_DIMENSIONS } from '../../types';
+import { useAuth } from '../../context/AuthContext';
 
 interface ScenarioModuleViewProps {
   scenario: ScenarioModule;
@@ -24,10 +25,12 @@ export const ScenarioModuleView: React.FC<ScenarioModuleViewProps> = ({
   onBackToScenarios,
   onScenarioCompleted,
 }) => {
+  const { token } = useAuth();
   const [currentStepIndex, setCurrentStepIndex] = useState<number>(0);
   const [responses, setResponses] = useState<Record<string, any>>({});
   const [scores, setScores] = useState<Record<string, number>>({});
   const [evaluating, setEvaluating] = useState<boolean>(false);
+  const [evalError, setEvalError] = useState<string | null>(null);
   const [feedbackMap, setFeedbackMap] = useState<Record<string, string>>({});
 
   // Inputs
@@ -36,13 +39,13 @@ export const ScenarioModuleView: React.FC<ScenarioModuleViewProps> = ({
   const [vivaInput, setVivaInput] = useState<string>('');
 
   const currentTask = scenario.tasks[currentStepIndex];
-  const isCompleted = scenario.tasks.every((t) => responses[t.id] !== undefined);
 
   const totalEarned = Object.values(scores).reduce<number>((a, b) => a + (Number(b) || 0), 0);
   const maxScore = scenario.tasks.reduce((a, t) => a + t.points, 0);
 
   const handleSubmitStep = async () => {
     if (!currentTask) return;
+    setEvalError(null);
 
     if (currentTask.type === 'parameter_select') {
       if (!selectedOpt) return;
@@ -68,40 +71,43 @@ export const ScenarioModuleView: React.FC<ScenarioModuleViewProps> = ({
       setFeedbackMap((prev) => ({
         ...prev,
         [currentTask.id]: isCorrect
-          ? `Calculated ${val} mW within safety margins.`
+          ? `Calculated ${val} within safety margins.`
           : `Calculated ${val}, expected ~${target}. Thermal dissipation exceeds design limits.`,
       }));
     } else if (currentTask.type === 'viva_text') {
       if (!vivaInput.trim()) return;
       setEvaluating(true);
       try {
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (token) {
+          headers.Authorization = `Bearer ${token}`;
+        }
         const res = await fetch('/api/gemini/viva-evaluate', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
           body: JSON.stringify({
             question: currentTask.question,
-            studentAnswer: vivaInput,
+            studentAnswer: vivaInput.trim(),
             rubric: currentTask.rubric,
             context: `${scenario.title} - ${scenario.realWorldRole}`,
             competencyDimension: COMPETENCY_DIMENSIONS[currentTask.competencyDimension].label,
           }),
         });
-        const data = await res.json();
-        const score = Math.round((data.score / 100) * currentTask.points);
-        setResponses((prev) => ({ ...prev, [currentTask.id]: vivaInput }));
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.success) {
+          throw new Error(data?.error || `AI evaluation failed (HTTP ${res.status}).`);
+        }
+        const score = Math.round((Math.max(0, Math.min(100, Number(data.score ?? 0))) / 100) * currentTask.points);
+        setResponses((prev) => ({ ...prev, [currentTask.id]: vivaInput.trim() }));
         setScores((prev) => ({ ...prev, [currentTask.id]: score }));
         setFeedbackMap((prev) => ({
           ...prev,
           [currentTask.id]: data.feedback || 'Diagnosis and protection proposal evaluated.',
         }));
-      } catch {
-        const score = Math.round(currentTask.points * 0.85);
-        setResponses((prev) => ({ ...prev, [currentTask.id]: vivaInput }));
-        setScores((prev) => ({ ...prev, [currentTask.id]: score }));
-        setFeedbackMap((prev) => ({
-          ...prev,
-          [currentTask.id]: 'Proposed viable hardware protection against open-circuit baseline shift.',
-        }));
+      } catch (err: any) {
+        setEvalError(err?.message || 'Unable to reach AI evaluator. Please retry.');
+        setEvaluating(false);
+        return;
       } finally {
         setEvaluating(false);
       }
@@ -269,6 +275,14 @@ export const ScenarioModuleView: React.FC<ScenarioModuleViewProps> = ({
                 onChange={(e) => setVivaInput(e.target.value)}
                 className="w-full rounded-lg border border-stone-300 dark:border-stone-700 bg-white dark:bg-stone-800 p-3 text-xs text-stone-900 dark:text-stone-100 placeholder:text-stone-400 focus:border-stone-900 dark:focus:border-purple-400 focus:outline-hidden"
               />
+            </div>
+          )}
+
+          {/* Evaluation error banner */}
+          {evalError && (
+            <div className="flex items-start gap-2 rounded-lg border border-rose-200 dark:border-rose-900 bg-rose-50 dark:bg-rose-950/40 p-3 text-xs text-rose-800 dark:text-rose-200">
+              <AlertCircle className="h-4 w-4 text-rose-600 dark:text-rose-400 shrink-0 mt-0.5" />
+              <span>{evalError}</span>
             </div>
           )}
 
