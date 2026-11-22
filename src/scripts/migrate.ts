@@ -2,17 +2,12 @@ import "dotenv/config";
 import { Pool } from "pg";
 import fs from "node:fs";
 import path from "node:path";
+import { resolvePostgresPoolConfig } from "../db/config";
 
-async function main() {
-  // Connect directly to Cloud SQL PostgreSQL using Object Method (SQL_* env vars).
-  const pool = new Pool({
-    host: process.env.SQL_HOST,
-    user: process.env.SQL_ADMIN_USER || process.env.SQL_USER,
-    password: process.env.SQL_ADMIN_PASSWORD || process.env.SQL_PASSWORD,
-    database: process.env.SQL_DB_NAME,
-    max: 5,
-    connectionTimeoutMillis: 15000,
-  });
+export async function runMigrations() {
+  const pool = new Pool(
+    resolvePostgresPoolConfig(process.env, { preferAdmin: true, maxOverride: 5 })
+  );
 
   try {
     const client = await pool.connect();
@@ -78,7 +73,7 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+runMigrations().catch((error) => {
   console.error("Migration failed:", error.message);
   process.exitCode = 1;
 });

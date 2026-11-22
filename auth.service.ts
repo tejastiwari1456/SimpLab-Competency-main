@@ -136,9 +136,15 @@ class AuthService {
     } else {
       // Derive a process-local random secret when JWT_SECRET is not configured, avoiding hardcoded secrets
       this.jwtSecret = crypto.randomBytes(32).toString("hex");
-      console.warn(
-        "[AuthService] JWT_SECRET not configured; generated ephemeral runtime secret. Set JWT_SECRET in environment for persistent tokens across restarts."
-      );
+      if (process.env.VERCEL) {
+        console.error(
+          "[AuthService] CRITICAL: JWT_SECRET is not configured in Vercel Environment Variables. Tokens will not persist across serverless cold starts until JWT_SECRET (16+ chars) is set."
+        );
+      } else {
+        console.warn(
+          "[AuthService] JWT_SECRET not configured; generated ephemeral runtime secret. Set JWT_SECRET in environment for persistent tokens across restarts."
+        );
+      }
     }
 
     this.jwtAccessExpiry = process.env.JWT_ACCESS_EXPIRES_IN || "2h";

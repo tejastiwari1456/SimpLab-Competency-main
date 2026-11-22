@@ -132,7 +132,7 @@ function getRoomUsers(roomId: string): PairLabUser[] {
   return Array.from(clients).map((c) => c.user);
 }
 
-export function setupPairLabServer(server: http.Server, app: express.Express) {
+export function registerPairLabRestRoutes(app: express.Express) {
   // REST API Routes
   app.get("/api/pair-lab/rooms/:roomId", (req: Request, res: Response) => {
     const roomId = (req.params.roomId || "").toUpperCase();
@@ -165,8 +165,10 @@ export function setupPairLabServer(server: http.Server, app: express.Express) {
     });
     return res.json({ success: true, room: freshRoom });
   });
+}
 
-  // WebSocket Server Setup
+export function setupPairLabWebSockets(server: http.Server) {
+  // WebSocket Server Setup (long-running Node server only; serverless runtimes skip WS upgrades)
   const wss = new WebSocketServer({ server, path: "/ws/pair-lab" });
 
   wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
@@ -528,3 +530,9 @@ export function setupPairLabServer(server: http.Server, app: express.Express) {
 
   console.log("[SimLab] Pair Lab WebSocket server initialized on path /ws/pair-lab");
 }
+
+export function setupPairLabServer(server: http.Server, app: express.Express) {
+  registerPairLabRestRoutes(app);
+  setupPairLabWebSockets(server);
+}
+

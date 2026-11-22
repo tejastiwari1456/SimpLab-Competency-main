@@ -165,7 +165,10 @@ export function authRateLimiter(req: Request, res: Response, next: NextFunction)
   const maxAttempts = parseInt(process.env.AUTH_RATE_LIMIT_MAX || "30", 10);
 
   const ip =
-    (req.headers["x-forwarded-for"] as string) ||
+    req.ip ||
+    (typeof req.headers["x-forwarded-for"] === "string"
+      ? req.headers["x-forwarded-for"].split(",")[0].trim()
+      : undefined) ||
     req.socket.remoteAddress ||
     "127.0.0.1";
   const path = req.path;
