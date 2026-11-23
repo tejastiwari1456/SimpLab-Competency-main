@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   getDatabaseConfigSummary,
+  parsePostgresUrl,
   resolvePostgresPoolConfig,
 } from "./config";
 
@@ -36,6 +37,39 @@ test("uses DATABASE_URL with serverless pool tuning and SSL on Vercel", () => {
   assert.deepEqual(cfg.ssl, { rejectUnauthorized: false });
 });
 
+test("auto-enables SSL and transaction-pooler limits for Supabase pooler URLs even outside Vercel", () => {
+  const cfg = resolvePostgresPoolConfig({
+    DATABASE_URL:
+      "postgresql://postgres.demo:plainPass@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres",
+  });
+
+  assert.equal(cfg.max, 5);
+  assert.equal(cfg.idleTimeoutMillis, 10000);
+  assert.deepEqual(cfg.ssl, { rejectUnauthorized: false });
+});
+
+test("safely parses Supabase URLs whose passwords contain unescaped ?, &, %, or newlines", () => {
+  const raw =
+    "postgresql://postgres.demo:p%A?b&c\n@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres";
+  const parsed = parsePostgresUrl(raw);
+  assert.ok(parsed);
+  assert.equal(parsed.host, "aws-1-ap-southeast-1.pooler.supabase.com");
+  assert.equal(parsed.port, 6543);
+  assert.equal(parsed.user, "postgres.demo");
+  assert.equal(parsed.password, "p%A?b&c");
+  assert.equal(parsed.database, "postgres");
+  assert.equal(parsed.needsStructuredFields, true);
+
+  const cfg = resolvePostgresPoolConfig({ DATABASE_URL: raw });
+  assert.equal(cfg.host, "aws-1-ap-southeast-1.pooler.supabase.com");
+  assert.equal(cfg.port, 6543);
+  assert.equal(cfg.user, "postgres.demo");
+  assert.equal(cfg.password, "p%A?b&c");
+  assert.equal(cfg.database, "postgres");
+  assert.equal(cfg.connectionString, undefined);
+  assert.deepEqual(cfg.ssl, { rejectUnauthorized: false });
+});
+
 test("respects explicit DATABASE_SSL=false override even on Vercel", () => {
   const cfg = resolvePostgresPoolConfig({
     VERCEL: "1",
@@ -67,10 +101,11 @@ test("prefers admin credentials when preferAdmin is enabled for migrations", () 
   assert.deepEqual(cfg.ssl, { rejectUnauthorized: false });
 });
 
-test("reports safe non-secret database configuration summary", () => {
+test("reports safe non-secret database configuration summary with provider detection", () => {
   assert.deepEqual(getDatabaseConfigSummary({}), {
     configured: false,
     mode: "unconfigured",
+    provider: "unconfigured",
     sslEnabled: false,
     serverless: false,
   });
@@ -78,11 +113,13 @@ test("reports safe non-secret database configuration summary", () => {
   assert.deepEqual(
     getDatabaseConfigSummary({
       VERCEL: "1",
-      POSTGRES_URL: "postgres://u:p@db.neon.tech/simlab",
+      DATABASE_URL:
+        "postgresql://postgres.ref:pass@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres",
     }),
     {
       configured: true,
       mode: "connection_url",
+      provider: "supabase",
       sslEnabled: true,
       serverless: true,
     }

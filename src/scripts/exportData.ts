@@ -85,7 +85,13 @@ async function exportDatabase() {
   }
 }
 
-exportDatabase().catch((err) => {
-  console.error("[Export] Failed:", err?.message || err);
-  process.exitCode = 1;
-});
+const isDirectRun =
+  typeof process.argv[1] === "string" &&
+  process.argv[1].replace(/\\/g, "/").endsWith("exportData.ts");
+
+if (isDirectRun) {
+  exportDatabase().catch((err) => {
+    console.error("[Export] Failed:", err?.message || err);
+    process.exitCode = 1;
+  });
+}

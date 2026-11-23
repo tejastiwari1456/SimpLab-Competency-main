@@ -145,6 +145,7 @@ app.get("/api/health", async (req: Request, res: Response) => {
     database: {
       configured: dbConfig.configured,
       mode: dbConfig.mode,
+      provider: dbConfig.provider,
       sslEnabled: dbConfig.sslEnabled,
       ...(dbHealth ? { connected: dbHealth.connected, latencyMs: dbHealth.latencyMs } : {}),
     },
