@@ -2,7 +2,7 @@
 
 This project is pre-configured for full-stack deployment on **Vercel**:
 - **Frontend (Vite + React SPA)**: Built into `dist/` via `npm run build:vercel` with SPA rewrites in `vercel.json`.
-- **Backend API (Express)**: Deployed as a Vercel Serverless Function at `api/index.ts` (handling all `/api/*` routes with a 30-second timeout for Gemini AI Viva, AI Mentor, and AI Faculty Insights).
+- **Backend API (Express)**: Bundled cleanly via `esbuild` (`npm run build:api` from `src/server/vercel.ts`) into a self-contained ESM Vercel Serverless Function at `api/index.js` (handling all `/api/*` routes with a 30-second timeout for Gemini AI Viva, AI Mentor, and AI Faculty Insights).
 - **Database (PostgreSQL)**: `src/db/index.ts` automatically supports both standard Vercel/managed PostgreSQL (`DATABASE_URL` / `POSTGRES_URL`) and Google Cloud SQL (`SQL_HOST`, `SQL_USER`, `SQL_PASSWORD`, `SQL_DB_NAME`) with serverless connection pooling and SSL auto-detection.
 
 ---
